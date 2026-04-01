@@ -1,9 +1,9 @@
-use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use starbreaker_common::Progress;
 use starbreaker_datacore::types::CigGuid;
@@ -12,11 +12,21 @@ use starbreaker_p4k::MappedP4k;
 use crate::error::AppError;
 use crate::state::AppState;
 
-/// Discovery result returned to the frontend.
 #[derive(Serialize)]
 pub struct DiscoverResult {
     pub path: String,
     pub source: String,
+}
+
+#[derive(Serialize)]
+pub struct InstallRootInfo {
+    pub path: String,
+    pub source: String,
+}
+
+#[derive(Default, Deserialize, Serialize)]
+struct AppSettings {
+    install_root: Option<PathBuf>,
 }
 
 /// A directory entry returned to the frontend.
@@ -33,23 +43,141 @@ pub enum DirEntryDto {
     Directory { name: String },
 }
 
-/// Progress event payload.
 #[derive(Clone, Serialize)]
 pub struct LoadProgress {
     pub fraction: f32,
     pub message: String,
 }
 
-/// Discover all Data.p4k installations across channels.
+fn settings_path(app: &AppHandle) -> Result<PathBuf, AppError> {
+    let config_dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|e| AppError::Internal(format!("failed to resolve config directory: {e}")))?;
+    Ok(config_dir.join("settings.json"))
+}
+
+fn load_settings(app: &AppHandle) -> Result<AppSettings, AppError> {
+    let path = settings_path(app)?;
+    if !path.is_file() {
+        return Ok(AppSettings::default());
+    }
+
+    let bytes = std::fs::read(&path)?;
+    serde_json::from_slice(&bytes).map_err(|e| {
+        AppError::Internal(format!(
+            "failed to parse settings at '{}': {e}",
+            path.display()
+        ))
+    })
+}
+
+fn save_settings(app: &AppHandle, settings: &AppSettings) -> Result<(), AppError> {
+    let path = settings_path(app)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let bytes = serde_json::to_vec_pretty(settings).map_err(|e| {
+        AppError::Internal(format!(
+            "failed to serialize settings for '{}': {e}",
+            path.display()
+        ))
+    })?;
+    std::fs::write(path, bytes)?;
+    Ok(())
+}
+
+fn active_install_root(app: &AppHandle) -> Result<(PathBuf, &'static str), AppError> {
+    let settings = load_settings(app)?;
+    if let Some(path) = settings.install_root {
+        return Ok((path, "custom"));
+    }
+    Ok((
+        PathBuf::from(starbreaker_common::discover::DEFAULT_ROOT),
+        "default",
+    ))
+}
+
+fn discover_from_root(root: &Path) -> Vec<DiscoverResult> {
+    let mut discoveries = Vec::new();
+
+    let direct_p4k = root.join("Data.p4k");
+    if direct_p4k.is_file() {
+        let source = root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| {
+                starbreaker_common::discover::CHANNELS
+                    .iter()
+                    .any(|channel| channel.eq_ignore_ascii_case(name))
+            })
+            .unwrap_or("custom")
+            .to_string();
+
+        discoveries.push(DiscoverResult {
+            path: direct_p4k.to_string_lossy().into_owned(),
+            source,
+        });
+    }
+
+    for &channel in starbreaker_common::discover::CHANNELS {
+        let path = root.join(channel).join("Data.p4k");
+        if path.is_file() {
+            discoveries.push(DiscoverResult {
+                path: path.to_string_lossy().into_owned(),
+                source: channel.to_string(),
+            });
+        }
+    }
+
+    discoveries
+}
+
 #[tauri::command]
-pub fn discover_p4k() -> Vec<DiscoverResult> {
-    starbreaker_common::discover::find_all_p4k()
-        .into_iter()
-        .map(|d| DiscoverResult {
-            path: d.path.to_string_lossy().into_owned(),
-            source: d.source,
-        })
-        .collect()
+pub fn get_install_root(app: AppHandle) -> Result<InstallRootInfo, AppError> {
+    let (path, source) = active_install_root(&app)?;
+    Ok(InstallRootInfo {
+        path: path.to_string_lossy().into_owned(),
+        source: source.to_string(),
+    })
+}
+
+#[tauri::command]
+pub fn set_install_root(app: AppHandle, path: String) -> Result<(), AppError> {
+    let install_root = PathBuf::from(path);
+    if !install_root.is_dir() {
+        return Err(AppError::Internal(format!(
+            "install directory '{}' does not exist",
+            install_root.display()
+        )));
+    }
+
+    let settings = AppSettings {
+        install_root: Some(install_root),
+    };
+    save_settings(&app, &settings)
+}
+
+#[tauri::command]
+pub fn reset_install_root(app: AppHandle) -> Result<(), AppError> {
+    save_settings(&app, &AppSettings::default())
+}
+
+#[tauri::command]
+pub fn discover_p4k(app: AppHandle) -> Result<Vec<DiscoverResult>, AppError> {
+    if let Ok(val) = std::env::var(starbreaker_common::discover::ENV_P4K) {
+        let path = PathBuf::from(val);
+        if path.is_file() {
+            return Ok(vec![DiscoverResult {
+                path: path.to_string_lossy().into_owned(),
+                source: "env".to_string(),
+            }]);
+        }
+    }
+
+    let (root, _) = active_install_root(&app)?;
+    Ok(discover_from_root(&root))
 }
 
 /// Open a P4k file and store it in managed state.
@@ -72,10 +200,7 @@ pub async fn open_p4k(
         let poll_thread = std::thread::spawn(move || {
             loop {
                 let (fraction, message) = progress_poll.get();
-                let _ = app_clone.emit(
-                    "load-progress",
-                    LoadProgress { fraction, message },
-                );
+                let _ = app_clone.emit("load-progress", LoadProgress { fraction, message });
                 if fraction >= 1.0 {
                     break;
                 }
@@ -99,8 +224,7 @@ pub async fn open_p4k(
         Ok::<_, AppError>((p4k, dcb_bytes, loc_map, record_index))
     })
     .await
-    .map_err(|e| AppError::Internal(format!("task join error: {e}")))?
-    ?;
+    .map_err(|e| AppError::Internal(format!("task join error: {e}")))??;
 
     let count = mapped.len();
     let arc_p4k = Arc::new(mapped);
@@ -117,7 +241,9 @@ pub async fn open_p4k(
 #[tauri::command]
 pub fn list_subdirs(state: State<'_, AppState>, path: String) -> Result<Vec<String>, AppError> {
     let guard = state.p4k.lock();
-    let p4k = guard.as_ref().ok_or_else(|| AppError::Internal("P4k not loaded".into()))?;
+    let p4k = guard
+        .as_ref()
+        .ok_or_else(|| AppError::Internal("P4k not loaded".into()))?;
 
     Ok(p4k.list_subdirs(&path))
 }
@@ -126,7 +252,9 @@ pub fn list_subdirs(state: State<'_, AppState>, path: String) -> Result<Vec<Stri
 #[tauri::command]
 pub fn list_dir(state: State<'_, AppState>, path: String) -> Result<Vec<DirEntryDto>, AppError> {
     let guard = state.p4k.lock();
-    let p4k = guard.as_ref().ok_or_else(|| AppError::Internal("P4k not loaded".into()))?;
+    let p4k = guard
+        .as_ref()
+        .ok_or_else(|| AppError::Internal("P4k not loaded".into()))?;
 
     let entries = p4k.list_dir(&path);
     let dtos = entries
@@ -168,7 +296,10 @@ pub struct CategoryDto {
 pub async fn scan_categories(state: State<'_, AppState>) -> Result<Vec<CategoryDto>, AppError> {
     let dcb_bytes = {
         let guard = state.dcb_bytes.lock();
-        guard.as_ref().ok_or_else(|| AppError::Internal("DataCore not loaded".into()))?.clone()
+        guard
+            .as_ref()
+            .ok_or_else(|| AppError::Internal("DataCore not loaded".into()))?
+            .clone()
     };
     let loc = {
         let guard = state.localization.lock();
@@ -329,11 +460,17 @@ pub async fn start_export(
     // Clone data out of state
     let p4k = {
         let guard = state.p4k.lock();
-        guard.as_ref().ok_or_else(|| AppError::Internal("P4k not loaded".into()))?.clone()
+        guard
+            .as_ref()
+            .ok_or_else(|| AppError::Internal("P4k not loaded".into()))?
+            .clone()
     };
     let dcb_bytes = {
         let guard = state.dcb_bytes.lock();
-        guard.as_ref().ok_or_else(|| AppError::Internal("DataCore not loaded".into()))?.clone()
+        guard
+            .as_ref()
+            .ok_or_else(|| AppError::Internal("DataCore not loaded".into()))?
+            .clone()
     };
     let cancel = state.export_cancel.clone();
 
@@ -381,7 +518,11 @@ pub async fn start_export(
 
         // Use a dedicated thread pool capped at half the CPU cores to avoid
         // melting the system — each export is memory-heavy (mesh + DDS + PNG).
-        let num_threads = (std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) / 2).max(2);
+        let num_threads = (std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            / 2)
+        .max(2);
         let pool = match rayon::ThreadPoolBuilder::new()
             .num_threads(num_threads)
             .build()
@@ -401,48 +542,56 @@ pub async fn start_export(
         };
 
         pool.install(|| {
-        use rayon::prelude::*;
-        record_ids.par_iter().zip(names.par_iter()).for_each(|(record_id, name)| {
-            if cancel.load(Ordering::Relaxed) {
-                return;
-            }
+            use rayon::prelude::*;
+            record_ids
+                .par_iter()
+                .zip(names.par_iter())
+                .for_each(|(record_id, name)| {
+                    if cancel.load(Ordering::Relaxed) {
+                        return;
+                    }
 
-            let i = completed.fetch_add(1, Ordering::Relaxed);
-            let _ = app.emit(
-                "export-progress",
-                ExportProgress {
-                    current: i + 1,
-                    total,
-                    entity_name: name.clone(),
-                    error: None,
-                },
-            );
-
-            let filename = format!("{}.glb", sanitize_filename(name));
-            let output_path = std::path::PathBuf::from(&output_dir).join(&filename);
-
-            match export_single(&db, &p4k, record_id, &output_path, &opts) {
-                Ok(()) => { success.fetch_add(1, Ordering::Relaxed); }
-                Err(e) => {
+                    let i = completed.fetch_add(1, Ordering::Relaxed);
                     let _ = app.emit(
                         "export-progress",
                         ExportProgress {
                             current: i + 1,
                             total,
                             entity_name: name.clone(),
-                            error: Some(format!("{name}: {e}")),
+                            error: None,
                         },
                     );
-                    errors.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        });
+
+                    let filename = format!("{}.glb", sanitize_filename(name));
+                    let output_path = std::path::PathBuf::from(&output_dir).join(&filename);
+
+                    match export_single(&db, &p4k, record_id, &output_path, &opts) {
+                        Ok(()) => {
+                            success.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            let _ = app.emit(
+                                "export-progress",
+                                ExportProgress {
+                                    current: i + 1,
+                                    total,
+                                    entity_name: name.clone(),
+                                    error: Some(format!("{name}: {e}")),
+                                },
+                            );
+                            errors.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
         }); // pool.install
 
-        let _ = app.emit("export-done", ExportDone {
-            success: success.load(Ordering::Relaxed),
-            errors: errors.load(Ordering::Relaxed),
-        });
+        let _ = app.emit(
+            "export-done",
+            ExportDone {
+                success: success.load(Ordering::Relaxed),
+                errors: errors.load(Ordering::Relaxed),
+            },
+        );
     });
 
     Ok(())

@@ -6,6 +6,11 @@ export interface DiscoverResult {
   source: string;
 }
 
+export interface InstallRootInfo {
+  path: string;
+  source: "default" | "custom";
+}
+
 export interface FileDirEntry {
   kind: "file";
   name: string;
@@ -23,6 +28,24 @@ export type DirEntry = FileDirEntry | DirectoryDirEntry;
 export interface LoadProgress {
   fraction: number;
   message: string;
+}
+
+function singleDialogPath(
+  result: string | string[] | null,
+): string | null {
+  return Array.isArray(result) ? (result[0] ?? null) : result;
+}
+
+export async function getInstallRoot(): Promise<InstallRootInfo> {
+  return invoke<InstallRootInfo>("get_install_root");
+}
+
+export async function setInstallRoot(path: string): Promise<void> {
+  return invoke<void>("set_install_root", { path });
+}
+
+export async function resetInstallRoot(): Promise<void> {
+  return invoke<void>("reset_install_root");
 }
 
 /** Discover all Data.p4k installations across channels. */
@@ -54,7 +77,17 @@ export async function browseP4k(): Promise<string | null> {
     multiple: false,
     directory: false,
   });
-  return result ?? null;
+  return singleDialogPath(result);
+}
+
+export async function browseInstallRoot(): Promise<string | null> {
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const result = await open({
+    title: "Select Star Citizen installation directory",
+    directory: true,
+    multiple: false,
+  });
+  return singleDialogPath(result);
 }
 
 /** Listen for progress events during P4k loading. */
@@ -150,7 +183,7 @@ export async function browseOutputDir(): Promise<string | null> {
     directory: true,
     multiple: false,
   });
-  return result ?? null;
+  return singleDialogPath(result);
 }
 
 // ── DataCore types ──

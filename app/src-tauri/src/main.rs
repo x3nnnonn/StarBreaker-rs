@@ -16,6 +16,9 @@ fn main() {
         .plugin(tauri_plugin_process::init())
         .manage(state::AppState::new())
         .invoke_handler(tauri::generate_handler![
+            commands::get_install_root,
+            commands::set_install_root,
+            commands::reset_install_root,
             commands::discover_p4k,
             commands::open_p4k,
             commands::list_dir,

@@ -1,6 +1,16 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useState } from "react";
 import { useAppStore } from "../stores/app-store";
-import { discoverP4k, openP4k, browseP4k, onLoadProgress } from "../lib/commands";
+import {
+  browseInstallRoot,
+  browseP4k,
+  discoverP4k,
+  getInstallRoot,
+  type InstallRootInfo,
+  onLoadProgress,
+  openP4k,
+  resetInstallRoot,
+  setInstallRoot,
+} from "../lib/commands";
 
 export function StartupScreen() {
   const loading = useAppStore((s) => s.loading);
@@ -15,13 +25,22 @@ export function StartupScreen() {
   const setError = useAppStore((s) => s.setError);
   const clearError = useAppStore((s) => s.clearError);
 
-  const hasDiscovered = useRef(false);
+  const [installRoot, setInstallRootInfo] = useState<InstallRootInfo | null>(null);
+  const [updatingRoot, setUpdatingRoot] = useState(false);
 
   useEffect(() => {
-    if (hasDiscovered.current) return;
-    hasDiscovered.current = true;
-    discoverP4k().then(setDiscoveries);
-  }, [setDiscoveries]);
+    void refreshStartup();
+  }, []);
+
+  const refreshStartup = async () => {
+    try {
+      const [root, found] = await Promise.all([getInstallRoot(), discoverP4k()]);
+      setInstallRootInfo(root);
+      setDiscoveries(found);
+    } catch (err) {
+      setError(String(err));
+    }
+  };
 
   const handleLoad = async (path: string, source: string) => {
     clearError();
@@ -47,6 +66,35 @@ export function StartupScreen() {
     const path = await browseP4k();
     if (path) {
       await handleLoad(path, "custom");
+    }
+  };
+
+  const handleChangeInstallRoot = async () => {
+    clearError();
+    const path = await browseInstallRoot();
+    if (!path) return;
+
+    setUpdatingRoot(true);
+    try {
+      await setInstallRoot(path);
+      await refreshStartup();
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setUpdatingRoot(false);
+    }
+  };
+
+  const handleResetInstallRoot = async () => {
+    clearError();
+    setUpdatingRoot(true);
+    try {
+      await resetInstallRoot();
+      await refreshStartup();
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setUpdatingRoot(false);
     }
   };
 
@@ -85,6 +133,42 @@ export function StartupScreen() {
         {/* Channel buttons */}
         {!loading && (
           <div className="flex flex-col gap-3">
+            <div className="p-4 bg-bg-alt border border-border rounded-lg">
+              <div className="flex items-start justify-between gap-4">
+                <div className="min-w-0">
+                  <p className="text-xs text-text-dim uppercase tracking-wider font-semibold">
+                    {installRoot?.source === "custom"
+                      ? "Custom install directory"
+                      : "Default install directory"}
+                  </p>
+                  <p className="text-sm text-text mt-1 break-all">
+                    {installRoot?.path ?? "Loading..."}
+                  </p>
+                </div>
+                {installRoot?.source === "custom" && (
+                  <button
+                    onClick={handleResetInstallRoot}
+                    disabled={updatingRoot}
+                    className="shrink-0 text-xs text-text-dim hover:text-text transition-colors
+                               disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    Use built-in default
+                  </button>
+                )}
+              </div>
+
+              <button
+                onClick={handleChangeInstallRoot}
+                disabled={updatingRoot}
+                className="mt-3 w-full flex items-center justify-center gap-2 p-3 border border-border
+                           rounded-lg text-sm text-text-sub hover:text-text hover:border-primary/50
+                           hover:bg-primary/5 transition-colors cursor-pointer disabled:opacity-50
+                           disabled:cursor-not-allowed"
+              >
+                {updatingRoot ? "Updating directory..." : "Change installation directory..."}
+              </button>
+            </div>
+
             {discoveries.length > 0 && (
               <>
                 <p className="text-xs text-text-dim uppercase tracking-wider font-semibold">
@@ -121,7 +205,7 @@ export function StartupScreen() {
             {discoveries.length === 0 && (
               <div className="p-4 bg-bg-alt border border-border rounded-lg text-center">
                 <p className="text-sm text-text-dim">
-                  No Star Citizen installations detected.
+                  No Star Citizen installations detected in the selected directory.
                 </p>
               </div>
             )}
