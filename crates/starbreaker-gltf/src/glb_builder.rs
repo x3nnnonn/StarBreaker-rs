@@ -215,8 +215,7 @@ impl GlbBuilder {
         &mut self,
         mut child: crate::types::EntityPayload,
         scene_nodes: &[json::Index<json::Node>],
-        include_tangents: bool,
-        experimental_textures: bool,
+        material_mode: crate::pipeline::MaterialMode,
         fallback_palette: Option<&crate::mtl::TintPalette>,
         load_textures: &mut dyn FnMut(Option<&crate::mtl::MtlFile>) -> Option<crate::types::MaterialTextures>,
     ) {
@@ -240,8 +239,7 @@ impl GlbBuilder {
                 textures.as_ref(),
                 child.palette.as_ref().or(fallback_palette),
                 Some(&child.entity_name),
-                include_tangents,
-                experimental_textures,
+                material_mode,
             );
             drop(textures);
             child.mesh.positions = Vec::new();
@@ -310,7 +308,12 @@ impl GlbBuilder {
 
                 // Create a wrapper node for the child entity containing its NMC root nodes + bone nodes
                 let wrapper_idx = self.nodes_json.len() as u32;
-                self.node_name_to_idx.insert(child.entity_name.to_lowercase(), wrapper_idx);
+                // Only register if the name isn't already taken (e.g., by a parent NMC node
+                // with the same name — vehicle XML wheel parts use bone names as entity names).
+                let lower_name = child.entity_name.to_lowercase();
+                if !self.node_name_to_idx.contains_key(&lower_name) {
+                    self.node_name_to_idx.insert(lower_name, wrapper_idx);
+                }
                 let mut wrapper_children: Vec<json::Index<json::Node>> = child_root_nodes
                     .iter()
                     .map(|&i| json::Index::new(child_node_base + i))
@@ -333,7 +336,10 @@ impl GlbBuilder {
             } else {
                 // Empty NMC — use flat mesh
                 let idx = self.nodes_json.len() as u32;
-                self.node_name_to_idx.insert(child.entity_name.to_lowercase(), idx);
+                let lower_name = child.entity_name.to_lowercase();
+                if !self.node_name_to_idx.contains_key(&lower_name) {
+                    self.node_name_to_idx.insert(lower_name, idx);
+                }
                 let offset_matrix = offset_to_gltf_matrix(child.offset_position, child.offset_rotation);
                 self.nodes_json.push(json::Node {
                     name: Some(child.entity_name.clone()),
@@ -346,7 +352,10 @@ impl GlbBuilder {
         } else {
             // No NMC — single flat node
             let idx = self.nodes_json.len() as u32;
-            self.node_name_to_idx.insert(child.entity_name.to_lowercase(), idx);
+            let lower_name = child.entity_name.to_lowercase();
+            if !self.node_name_to_idx.contains_key(&lower_name) {
+                self.node_name_to_idx.insert(lower_name, idx);
+            }
             let offset_matrix = offset_to_gltf_matrix(child.offset_position, child.offset_rotation);
             self.nodes_json.push(json::Node {
                 name: Some(child.entity_name.clone()),
@@ -409,8 +418,7 @@ impl GlbBuilder {
     pub fn attach_interiors(
         &mut self,
         interiors: &crate::pipeline::LoadedInteriors,
-        include_tangents: bool,
-        experimental_textures: bool,
+        material_mode: crate::pipeline::MaterialMode,
         fallback_palette: Option<&crate::mtl::TintPalette>,
         load_textures: &mut dyn FnMut(Option<&crate::mtl::MtlFile>) -> Option<crate::types::MaterialTextures>,
         load_interior_mesh: &mut dyn FnMut(
@@ -474,8 +482,7 @@ impl GlbBuilder {
                         textures.as_ref(),
                         palette,
                         Some(&interiors.unique_cgfs[mesh_array_idx].name),
-                        include_tangents,
-                        experimental_textures,
+                        material_mode,
                     );
                     packed_cache.insert(cache_key, packed.mesh_idx);
                     Some(packed.mesh_idx)
@@ -537,9 +544,10 @@ impl GlbBuilder {
         textures: Option<&MaterialTextures>,
         palette: Option<&crate::mtl::TintPalette>,
         mesh_name: Option<&str>,
-        include_tangents: bool,
-        experimental_textures: bool,
+        material_mode: crate::pipeline::MaterialMode,
     ) -> PackedMeshInfo {
+        let include_tangents = material_mode.include_tangents();
+        let experimental_textures = material_mode.experimental();
         // Ensure 4-byte alignment
         while !self.bin.len().is_multiple_of(4) {
             self.bin.push(0);
@@ -837,6 +845,11 @@ impl GlbBuilder {
                 node_submeshes[nidx].push(i);
             }
         }
+        log::debug!(
+            "  NMC hierarchy: {} nodes, {} submeshes, has_mesh={}, root='{}'",
+            nmc.nodes.len(), submeshes.len(), has_mesh,
+            nmc.nodes.first().map(|n| n.name.as_str()).unwrap_or("?"),
+        );
 
         // Create per-NMC-node meshes.
         let mut node_mesh_idx: Vec<Option<u32>> = vec![None; nmc.nodes.len()];
@@ -999,13 +1012,12 @@ impl GlbBuilder {
             }
             let eo = &metadata.export_options;
             map.insert("export_options".into(), serde_json::json!({
-                "texture_mip": eo.texture_mip,
+                "material_mode": eo.material_mode,
+                "format": eo.format,
                 "lod_level": eo.lod_level,
+                "texture_mip": eo.texture_mip,
+                "include_attachments": eo.include_attachments,
                 "include_interior": eo.include_interior,
-                "include_tangents": eo.include_tangents,
-                "include_lights": eo.include_lights,
-                "include_textures": eo.include_textures,
-                "include_materials": eo.include_materials,
             }));
             Some(serde_json::value::RawValue::from_string(
                 serde_json::to_string(&serde_json::Value::Object(map))?
@@ -1152,7 +1164,8 @@ fn build_materials(
     submeshes.iter().map(|sub| {
         let mat = build_material(sub, materials, palette, submaterial_texture_idx, submaterial_normal_idx, submaterial_roughness_idx, experimental_textures);
         let key = format!(
-            "{:?}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}",
+            "{}|{:?}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}",
+            mat.name.as_deref().unwrap_or(""),
             mat.pbr_metallic_roughness.base_color_factor,
             mat.pbr_metallic_roughness.metallic_factor,
             mat.pbr_metallic_roughness.roughness_factor,
@@ -1193,7 +1206,27 @@ fn build_material(
                 Some(json::material::AlphaCutoff(v)),
             ),
         };
-        let name = if m.name.is_empty() { sub.material_name.clone() } else { Some(m.name.clone()) };
+        let base_name = if m.name.is_empty() {
+            sub.material_name.clone().unwrap_or_default()
+        } else {
+            m.name.clone()
+        };
+        // CGF-Converter compatible naming: {mtl_stem}_mtl_{material_name}_0{material_id}
+        let name = {
+            let mtl_stem = materials.and_then(|mtl| {
+                mtl.source_path.as_ref().and_then(|p| {
+                    let file = p.rsplit(['\\', '/']).next()?;
+                    Some(file.strip_suffix(".mtl").unwrap_or(file).to_string())
+                })
+            });
+            if let Some(stem) = mtl_stem {
+                Some(format!("{stem}_mtl_{base_name}_0{}", sub.material_id))
+            } else if base_name.is_empty() {
+                None
+            } else {
+                Some(base_name)
+            }
+        };
         let palette_color = palette.and_then(|p| match m.palette_tint {
             1 => Some(p.primary),
             2 => Some(p.secondary),

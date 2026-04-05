@@ -60,9 +60,6 @@ impl DdsFile {
             None
         };
 
-        let format = resolve_format(&header.pixel_format, dxt10_header.as_ref())?;
-        let block_size = format.block_size();
-
         let mip_count = std::cmp::max(1, header.mipmap_count) as usize;
 
         // Determine number of faces (cubemaps have 6 faces)
@@ -70,7 +67,9 @@ impl DdsFile {
 
         // Calculate sizes for each mip level (per face)
         let mip_sizes: Vec<usize> = (0..mip_count)
-            .map(|level| mip_byte_size(header.width, header.height, level, block_size))
+            .map(|level| {
+                compute_mip_size(&header.pixel_format, dxt10_header.as_ref(), header.width, header.height, level)
+            })
             .collect();
 
         let remaining = reader.read_bytes(reader.remaining())?;
@@ -129,8 +128,6 @@ impl DdsFile {
             None
         };
 
-        let format = resolve_format(&header.pixel_format, dxt10_header.as_ref())?;
-        let block_size = format.block_size();
         let mip_count = std::cmp::max(1, header.mipmap_count) as usize;
 
         // Remaining bytes in the base file are the smallest mip level(s)
@@ -138,7 +135,9 @@ impl DdsFile {
 
         // Calculate sizes for each mip level
         let mip_sizes: Vec<usize> = (0..mip_count)
-            .map(|level| mip_byte_size(header.width, header.height, level, block_size))
+            .map(|level| {
+                compute_mip_size(&header.pixel_format, dxt10_header.as_ref(), header.width, header.height, level)
+            })
             .collect();
 
         // Probe for sibling split files: .8, .7, .6, ..., .1
@@ -258,11 +257,18 @@ impl DdsFile {
             });
         }
 
-        let format = resolve_format(&self.header.pixel_format, self.dxt10_header.as_ref())?;
-        let is_snorm = matches!(format, DxgiFormat::BC4Snorm | DxgiFormat::BC5Snorm);
-        let block_format = dxgi_to_block_format(format)?;
+        let pf = &self.header.pixel_format;
         let (w, h) = self.dimensions(mip_level);
         let data = &self.mip_data[mip_level];
+
+        // Uncompressed: FourCC is zero and rgb_bit_count is set
+        if pf.four_cc == [0; 4] && self.dxt10_header.is_none() && pf.rgb_bit_count > 0 {
+            return decode_uncompressed(data, w, h, pf);
+        }
+
+        let format = resolve_format(pf, self.dxt10_header.as_ref())?;
+        let is_snorm = matches!(format, DxgiFormat::BC4Snorm | DxgiFormat::BC5Snorm);
+        let block_format = dxgi_to_block_format(format)?;
 
         decode_block_compressed(data, w, h, block_format, is_snorm)
     }
@@ -331,13 +337,30 @@ impl DdsFile {
     }
 }
 
-/// Calculate the byte size for a single mip level of a block-compressed texture.
-fn mip_byte_size(width: u32, height: u32, mip_level: usize, block_size: usize) -> usize {
+/// Calculate the byte size for a single mip level.
+/// Works for both block-compressed and uncompressed formats.
+fn compute_mip_size(
+    pf: &DdsPixelFormat,
+    dxt10: Option<&DdsHeaderDxt10>,
+    width: u32,
+    height: u32,
+    mip_level: usize,
+) -> usize {
     let w = std::cmp::max(1, width >> mip_level);
     let h = std::cmp::max(1, height >> mip_level);
-    let blocks_w = w.div_ceil(4) as usize;
-    let blocks_h = h.div_ceil(4) as usize;
-    blocks_w * blocks_h * block_size
+
+    // Try block-compressed first
+    if let Ok(format) = resolve_format(pf, dxt10) {
+        let block_size = format.block_size();
+        let blocks_w = w.div_ceil(4) as usize;
+        let blocks_h = h.div_ceil(4) as usize;
+        return blocks_w * blocks_h * block_size;
+    }
+
+    // Uncompressed: use rgb_bit_count
+    let bpp = { pf.rgb_bit_count } as usize;
+    let byte_pp = if bpp > 0 { bpp / 8 } else { 4 }; // default to 32-bit
+    (w as usize) * (h as usize) * byte_pp
 }
 
 /// Determine number of faces (1 for regular textures, 6 for cubemaps).
@@ -375,7 +398,15 @@ pub fn resolve_format(
         let four_cc = { pf.four_cc };
         DxgiFormat::from_four_cc(&four_cc).ok_or_else(|| {
             let cc = String::from_utf8_lossy(&four_cc);
-            DdsError::UnsupportedFormat(format!("FourCC '{cc}'"))
+            let flags = { pf.flags };
+            let bpp = { pf.rgb_bit_count };
+            let rm = { pf.r_bit_mask };
+            let gm = { pf.g_bit_mask };
+            let bm = { pf.b_bit_mask };
+            let am = { pf.a_bit_mask };
+            DdsError::UnsupportedFormat(format!(
+                "FourCC '{cc}' (flags=0x{flags:08X}, bpp={bpp}, rmask=0x{rm:08X}, gmask=0x{gm:08X}, bmask=0x{bm:08X}, amask=0x{am:08X})"
+            ))
         })
     }
 }
@@ -390,4 +421,54 @@ fn dxgi_to_block_format(format: DxgiFormat) -> Result<BlockFormat, DdsError> {
         DxgiFormat::BC6hUf16 => Ok(BlockFormat::BC6H),
         DxgiFormat::BC7Unorm | DxgiFormat::BC7UnormSrgb => Ok(BlockFormat::BC7),
     }
+}
+
+/// Decode uncompressed pixel data using the DDS pixel format bit masks.
+fn decode_uncompressed(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    pf: &DdsPixelFormat,
+) -> Result<Vec<u8>, DdsError> {
+    let bpp = pf.rgb_bit_count as usize;
+    let byte_pp = bpp / 8;
+    if byte_pp == 0 || bpp % 8 != 0 {
+        return Err(DdsError::UnsupportedFormat(format!(
+            "uncompressed {bpp}-bit (non-byte-aligned)"
+        )));
+    }
+
+    let pixel_count = (width as usize) * (height as usize);
+    let expected = pixel_count * byte_pp;
+    if data.len() < expected {
+        return Err(DdsError::Decode(format!(
+            "uncompressed data too short: need {expected}, have {}",
+            data.len()
+        )));
+    }
+
+    let r_shift = pf.r_bit_mask.trailing_zeros();
+    let g_shift = pf.g_bit_mask.trailing_zeros();
+    let b_shift = pf.b_bit_mask.trailing_zeros();
+    let has_alpha = pf.a_bit_mask != 0;
+    let a_shift = pf.a_bit_mask.trailing_zeros();
+
+    let mut out = vec![255u8; pixel_count * 4];
+
+    for i in 0..pixel_count {
+        let off = i * byte_pp;
+        let mut raw = 0u32;
+        for b in 0..byte_pp {
+            raw |= (data[off + b] as u32) << (b * 8);
+        }
+
+        out[i * 4] = ((raw >> r_shift) & 0xFF) as u8;
+        out[i * 4 + 1] = ((raw >> g_shift) & 0xFF) as u8;
+        out[i * 4 + 2] = ((raw >> b_shift) & 0xFF) as u8;
+        if has_alpha {
+            out[i * 4 + 3] = ((raw >> a_shift) & 0xFF) as u8;
+        }
+    }
+
+    Ok(out)
 }

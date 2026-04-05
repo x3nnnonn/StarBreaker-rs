@@ -30,22 +30,28 @@ export interface LoadProgress {
   message: string;
 }
 
-function singleDialogPath(
-  result: string | string[] | null,
-): string | null {
-  return Array.isArray(result) ? (result[0] ?? null) : result;
+export interface SystemPalette {
+  scheme: string;
+  background: string;
+  foreground: string;
+  accent: string;
+  success: string;
+  warning: string;
+  danger: string;
 }
 
-export async function getInstallRoot(): Promise<InstallRootInfo> {
-  return invoke<InstallRootInfo>("get_install_root");
+/** Get the OS system theme (dark/light, accent, palette). */
+export async function getSystemTheme(): Promise<SystemPalette> {
+  return invoke<SystemPalette>("get_system_theme");
 }
 
-export async function setInstallRoot(path: string): Promise<void> {
-  return invoke<void>("set_install_root", { path });
-}
-
-export async function resetInstallRoot(): Promise<void> {
-  return invoke<void>("reset_install_root");
+/** Listen for OS theme changes. */
+export function onSystemThemeChanged(
+  callback: (palette: SystemPalette) => void,
+): Promise<UnlistenFn> {
+  return listen<SystemPalette>("system-theme-changed", (event) => {
+    callback(event.payload);
+  });
 }
 
 /** Discover all Data.p4k installations across channels. */
@@ -53,9 +59,14 @@ export async function discoverP4k(): Promise<DiscoverResult[]> {
   return invoke<DiscoverResult[]>("discover_p4k");
 }
 
-/** Open a P4k file and load it into the backend. Returns entry count. */
-export async function openP4k(path: string): Promise<number> {
-  return invoke<number>("open_p4k", { path });
+export interface P4kInfo {
+  entry_count: number;
+  total_bytes: number;
+}
+
+/** Open a P4k file and load it into the backend. */
+export async function openP4k(path: string): Promise<P4kInfo> {
+  return invoke<P4kInfo>("open_p4k", { path });
 }
 
 /** List directory contents from the loaded P4k. */
@@ -119,25 +130,25 @@ export interface ExportRequest {
   output_dir: string;
   lod: number;
   mip: number;
-  include_textures: boolean;
+  material_mode: string;
+  format: string;
+  include_attachments: boolean;
   include_interior: boolean;
-  include_normals: boolean;
-  include_lights: boolean;
-  include_tangents: boolean;
-  include_materials: boolean;
-  experimental_textures: boolean;
+  threads: number;
 }
 
 export interface ExportProgress {
   current: number;
   total: number;
   entity_name: string;
+  entity_id: string;
   error: string | null;
 }
 
 export interface ExportDone {
   success: number;
   errors: number;
+  succeeded_ids: string[];
 }
 
 // ── Export commands ──
@@ -244,6 +255,15 @@ export async function dcExportXml(recordId: string, outputPath: string): Promise
   return invoke<void>("dc_export_xml", { recordId, outputPath });
 }
 
+/** Export all records under a folder path. Returns count of exported records. */
+export async function dcExportFolder(
+  pathPrefix: string,
+  format: "json" | "xml",
+  outputDir: string,
+): Promise<number> {
+  return invoke<number>("dc_export_folder", { pathPrefix, format, outputDir });
+}
+
 export interface BacklinkDto {
   name: string;
   id: string;
@@ -342,4 +362,86 @@ export async function audioDecodeWem(
   bankName: string,
 ): Promise<number[]> {
   return invoke<number[]>("audio_decode_wem", { mediaId, sourceType, bankName });
+}
+
+export interface FolderExtractProgress {
+  current: number;
+  total: number;
+  name: string;
+}
+
+/** Listen for folder extract progress events. */
+export function onFolderExtractProgress(
+  callback: (progress: FolderExtractProgress) => void,
+): Promise<UnlistenFn> {
+  return listen<FolderExtractProgress>("folder-extract-progress", (event) => {
+    callback(event.payload);
+  });
+}
+
+/** Extract files under a P4k folder path to disk. Optional filter by extension (e.g. "mtl,xml"). */
+export async function extractP4kFolder(
+  pathPrefix: string,
+  outputDir: string,
+  filter?: string,
+): Promise<number> {
+  return invoke<number>("extract_p4k_folder", { pathPrefix, outputDir, filter: filter ?? null });
+}
+
+// ── Raw file access ──
+
+/** Read a raw file from the P4K. */
+export async function readP4kFile(path: string): Promise<ArrayBuffer> {
+  const bytes = await invoke<number[]>("read_p4k_file", { path });
+  return new Uint8Array(bytes).buffer;
+}
+
+// ── Geometry preview ──
+
+/** Generate a GLB preview for a geometry file. Returns raw GLB bytes. */
+export async function previewGeometry(path: string): Promise<ArrayBuffer> {
+  const bytes = await invoke<number[]>("preview_geometry", { path });
+  return new Uint8Array(bytes).buffer;
+}
+
+// ── XML preview ──
+
+/** Decode a CryXMLB file and return formatted XML text. */
+export async function previewXml(path: string): Promise<string> {
+  return invoke<string>("preview_xml", { path });
+}
+
+// ── DDS preview ──
+
+export interface DdsPreviewResult {
+  png: number[];
+  width: number;
+  height: number;
+  mip_level: number;
+  mip_count: number;
+}
+
+/** Decode a DDS texture and return PNG bytes + metadata. */
+export async function previewDds(
+  path: string,
+  mip?: number,
+): Promise<DdsPreviewResult> {
+  return invoke<DdsPreviewResult>("preview_dds", { path, mip: mip ?? null });
+}
+
+/** Save a DDS texture from P4K as a PNG file to disk. */
+export async function exportDdsPng(
+  path: string,
+  outputPath: string,
+  mip?: number,
+): Promise<void> {
+  return invoke<void>("export_dds_png", { path, outputPath, mip: mip ?? null });
+}
+
+/** Extract a single file from P4K to disk. */
+export async function extractP4kFile(
+  path: string,
+  outputPath: string,
+): Promise<void> {
+  return invoke<void>("extract_p4k_file", { path, outputPath });
 }

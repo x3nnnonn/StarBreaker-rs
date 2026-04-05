@@ -1,5 +1,7 @@
 import { create } from "zustand";
+import { persist } from "zustand/middleware";
 import type { CategoryDto, ExportDone } from "../lib/commands";
+import { tauriStorage } from "../lib/tauri-storage";
 
 interface ExportState {
   // Categories
@@ -25,23 +27,19 @@ interface ExportState {
   // Export options
   lod: number;
   mip: number;
-  includeTextures: boolean;
+  materialMode: string;
+  format: string;
+  includeAttachments: boolean;
   includeInterior: boolean;
-  includeNormals: boolean;
-  includeLights: boolean;
-  includeTangents: boolean;
-  includeMaterials: boolean;
-  experimentalTextures: boolean;
+  threads: number;
   outputDir: string | null;
   setLod: (v: number) => void;
   setMip: (v: number) => void;
-  setIncludeTextures: (v: boolean) => void;
+  setMaterialMode: (v: string) => void;
+  setFormat: (v: string) => void;
+  setIncludeAttachments: (v: boolean) => void;
   setIncludeInterior: (v: boolean) => void;
-  setIncludeNormals: (v: boolean) => void;
-  setIncludeLights: (v: boolean) => void;
-  setIncludeTangents: (v: boolean) => void;
-  setIncludeMaterials: (v: boolean) => void;
-  setExperimentalTextures: (v: boolean) => void;
+  setThreads: (v: number) => void;
   setOutputDir: (dir: string | null) => void;
 
   // Export progress
@@ -55,9 +53,24 @@ interface ExportState {
   setProgress: (current: number, total: number, label: string) => void;
   addExportError: (msg: string) => void;
   setResult: (result: ExportDone | null) => void;
+  deselectIds: (ids: string[]) => void;
 }
 
-export const useExportStore = create<ExportState>((set) => ({
+type PersistedExportState = Pick<
+  ExportState,
+  | "lod"
+  | "mip"
+  | "materialMode"
+  | "includeAttachments"
+  | "includeInterior"
+  | "threads"
+  | "outputDir"
+  | "hideNpcVariants"
+>;
+
+export const useExportStore = create<ExportState>()(
+  persist<ExportState, [], [], PersistedExportState>(
+    (set) => ({
   categories: [],
   categoriesLoading: false,
   activeCategory: 0,
@@ -93,23 +106,19 @@ export const useExportStore = create<ExportState>((set) => ({
 
   lod: 1,
   mip: 2,
-  includeTextures: true,
+  materialMode: "textures",
+  format: "glb",
+  includeAttachments: true,
   includeInterior: true,
-  includeNormals: true,
-  includeLights: true,
-  includeTangents: true,
-  includeMaterials: true,
-  experimentalTextures: false,
+  threads: 0,
   outputDir: null,
   setLod: (v) => set({ lod: v }),
   setMip: (v) => set({ mip: v }),
-  setIncludeTextures: (v) => set({ includeTextures: v }),
+  setMaterialMode: (v) => set({ materialMode: v }),
+  setFormat: (v) => set({ format: v }),
+  setIncludeAttachments: (v) => set({ includeAttachments: v }),
   setIncludeInterior: (v) => set({ includeInterior: v }),
-  setIncludeNormals: (v) => set({ includeNormals: v }),
-  setIncludeLights: (v) => set({ includeLights: v }),
-  setIncludeTangents: (v) => set({ includeTangents: v }),
-  setIncludeMaterials: (v) => set({ includeMaterials: v }),
-  setExperimentalTextures: (v) => set({ experimentalTextures: v }),
+  setThreads: (v) => set({ threads: v }),
   setOutputDir: (dir) => set({ outputDir: dir }),
 
   exporting: false,
@@ -125,4 +134,26 @@ export const useExportStore = create<ExportState>((set) => ({
   addExportError: (msg) =>
     set((s) => ({ exportErrors: [...s.exportErrors, msg] })),
   setResult: (result) => set({ result, exporting: false }),
-}));
+  deselectIds: (ids) =>
+    set((s) => {
+      const next = new Set(s.selected);
+      for (const id of ids) next.delete(id);
+      return { selected: next };
+    }),
+    }),
+    {
+      name: "export",
+      storage: tauriStorage,
+      partialize: (s) => ({
+        lod: s.lod,
+        mip: s.mip,
+        materialMode: s.materialMode,
+        includeAttachments: s.includeAttachments,
+        includeInterior: s.includeInterior,
+        threads: s.threads,
+        outputDir: s.outputDir,
+        hideNpcVariants: s.hideNpcVariants,
+      }),
+    },
+  ),
+);

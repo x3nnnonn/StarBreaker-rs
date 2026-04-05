@@ -32,23 +32,19 @@ export function ExportView() {
 
   const lod = useExportStore((s) => s.lod);
   const mip = useExportStore((s) => s.mip);
-  const includeTextures = useExportStore((s) => s.includeTextures);
+  const materialMode = useExportStore((s) => s.materialMode);
+  const format = useExportStore((s) => s.format);
+  const includeAttachments = useExportStore((s) => s.includeAttachments);
   const includeInterior = useExportStore((s) => s.includeInterior);
-  const includeNormals = useExportStore((s) => s.includeNormals);
-  const includeLights = useExportStore((s) => s.includeLights);
-  const includeTangents = useExportStore((s) => s.includeTangents);
-  const includeMaterials = useExportStore((s) => s.includeMaterials);
-  const experimentalTextures = useExportStore((s) => s.experimentalTextures);
+  const threads = useExportStore((s) => s.threads);
   const outputDir = useExportStore((s) => s.outputDir);
   const setLod = useExportStore((s) => s.setLod);
   const setMip = useExportStore((s) => s.setMip);
-  const setIncludeTextures = useExportStore((s) => s.setIncludeTextures);
+  const setMaterialMode = useExportStore((s) => s.setMaterialMode);
+  const setFormat = useExportStore((s) => s.setFormat);
+  const setIncludeAttachments = useExportStore((s) => s.setIncludeAttachments);
   const setIncludeInterior = useExportStore((s) => s.setIncludeInterior);
-  const setIncludeNormals = useExportStore((s) => s.setIncludeNormals);
-  const setIncludeLights = useExportStore((s) => s.setIncludeLights);
-  const setIncludeTangents = useExportStore((s) => s.setIncludeTangents);
-  const setIncludeMaterials = useExportStore((s) => s.setIncludeMaterials);
-  const setExperimentalTextures = useExportStore((s) => s.setExperimentalTextures);
+  const setThreads = useExportStore((s) => s.setThreads);
   const setOutputDir = useExportStore((s) => s.setOutputDir);
 
   const exporting = useExportStore((s) => s.exporting);
@@ -61,6 +57,7 @@ export function ExportView() {
   const setProgress = useExportStore((s) => s.setProgress);
   const addExportError = useExportStore((s) => s.addExportError);
   const setResult = useExportStore((s) => s.setResult);
+  const deselectIds = useExportStore((s) => s.deselectIds);
 
   // Load categories on mount
   useEffect(() => {
@@ -92,6 +89,10 @@ export function ExportView() {
 
     onExportDone((r) => {
       if (!cancelled) {
+        // Auto-deselect successfully exported items so only failures remain selected
+        if (r.succeeded_ids.length > 0) {
+          deselectIds(r.succeeded_ids);
+        }
         setResult(r);
       }
     }).then((unlisten) => {
@@ -103,7 +104,7 @@ export function ExportView() {
       cancelled = true;
       for (const fn of unlisteners) fn();
     };
-  }, [setProgress, addExportError, setResult]);
+  }, [setProgress, addExportError, setResult, deselectIds]);
 
   const category = categories[activeCategory];
   const filtered = category
@@ -134,18 +135,17 @@ export function ExportView() {
       output_dir: outputDir!,
       lod,
       mip,
-      include_textures: includeTextures,
+      material_mode: materialMode,
+      format: format,
+      include_attachments: includeAttachments,
       include_interior: includeInterior,
-      include_normals: includeNormals,
-      include_lights: includeLights,
-      include_tangents: includeTangents,
-      include_materials: includeMaterials,
-      experimental_textures: experimentalTextures,
+      threads,
     };
     setExporting(true);
     startExport(request).catch((err) => {
       console.error("Export failed:", err);
-      setExporting(false);
+      addExportError(String(err));
+      setResult({ success: 0, errors: selectedEntities.length, succeeded_ids: [] });
     });
   };
 
@@ -209,87 +209,68 @@ export function ExportView() {
 
       {/* ── Left: Entity Selection ── */}
       <div className="flex-1 flex flex-col min-w-0">
-        {/* Category tabs */}
-        <div className="flex items-center gap-1 px-3 pt-3 pb-2">
-          {categoriesLoading ? (
-            <span className="text-xs text-text-dim px-3 py-1.5">
-              Scanning entities...
-            </span>
-          ) : (
-            categories.map((cat, i) => (
-              <button
-                key={cat.name}
-                onClick={() => setActiveCategory(i)}
-                className={`
-                  px-3 py-1.5 rounded-full text-xs font-medium transition-colors cursor-pointer
-                  ${
-                    i === activeCategory
-                      ? "bg-primary/20 text-primary"
-                      : "text-text-dim hover:text-text-sub hover:bg-surface/60"
-                  }
-                `}
-              >
-                {cat.name}
-                <span className="ml-1.5 opacity-60">
-                  {cat.entities.length}
-                </span>
-              </button>
-            ))
-          )}
-        </div>
-
-        {/* Filters */}
-        <div className="flex items-center gap-3 px-3 pb-1">
-          <label className="flex items-center gap-1.5 cursor-pointer">
+        {/* Toolbar */}
+        <div className="flex items-center gap-2 px-3 border-b border-border bg-bg-alt shrink-0" style={{ height: "var(--toolbar-height)" }}>
+          <input
+            type="text"
+            placeholder="Search entities..."
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            className="flex-1 bg-surface rounded-md px-3 py-1.5 text-sm text-text placeholder:text-text-faint outline-none focus:ring-1 focus:ring-ring"
+          />
+          <label className="flex items-center gap-1.5 cursor-pointer shrink-0">
             <input
               type="checkbox"
               checked={hideNpcVariants}
               onChange={(e) => setHideNpcVariants(e.target.checked)}
-              className="accent-primary w-3 h-3"
+              className="accent-accent w-3 h-3"
             />
-            <span className="text-[11px] text-text-dim">Hide NPC/AI variants</span>
+            <span className="text-[11px] text-text-dim">Hide NPC</span>
           </label>
-        </div>
-
-        {/* Search + bulk actions */}
-        <div className="flex items-center gap-2 px-3 pb-2">
-          <div className="relative flex-1">
-            <svg
-              className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-text-faint"
-              fill="none"
-              viewBox="0 0 24 24"
-              stroke="currentColor"
-              strokeWidth={2}
-            >
-              <circle cx="11" cy="11" r="8" />
-              <path d="m21 21-4.35-4.35" />
-            </svg>
-            <input
-              type="text"
-              placeholder="Search entities..."
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              className="w-full bg-surface/50 border border-border rounded-md pl-8 pr-3 py-1.5 text-xs
-                         text-text placeholder:text-text-faint focus:outline-none focus:ring-1 focus:ring-ring"
-            />
-          </div>
           <button
             onClick={() => selectAllFiltered(filtered.map((e) => e.id))}
-            className="text-[11px] text-text-dim hover:text-text px-2 py-1 rounded hover:bg-surface/60
-                       transition-colors cursor-pointer"
+            className="text-[11px] text-text-dim hover:text-text px-2 py-1 rounded-md hover:bg-surface/60
+                       transition-colors cursor-pointer shrink-0"
           >
             All
           </button>
           <button
             onClick={() => clearFiltered(filtered.map((e) => e.id))}
-            className="text-[11px] text-text-dim hover:text-text px-2 py-1 rounded hover:bg-surface/60
-                       transition-colors cursor-pointer"
+            className="text-[11px] text-text-dim hover:text-text px-2 py-1 rounded-md hover:bg-surface/60
+                       transition-colors cursor-pointer shrink-0"
           >
             None
           </button>
-          <span className="text-[11px] text-text-faint tabular-nums">
+          <span className="text-[11px] text-text-faint tabular-nums shrink-0">
             {selectedInCategory}/{filtered.length}
           </span>
+          <div className="flex gap-1 shrink-0">
+            {categoriesLoading ? (
+              <span className="text-xs text-text-dim px-3 py-1">
+                Scanning...
+              </span>
+            ) : (
+              categories.map((cat, i) => (
+                <button
+                  key={cat.name}
+                  onClick={() => setActiveCategory(i)}
+                  className={`
+                    px-3 py-1 rounded-md text-xs font-medium transition-colors cursor-pointer
+                    ${
+                      i === activeCategory
+                        ? "bg-primary/15 text-text"
+                        : "bg-surface text-text-dim hover:bg-surface-hi hover:text-text"
+                    }
+                  `}
+                >
+                  {cat.name}
+                  <span className="ml-1.5 opacity-60">
+                    {cat.entities.length}
+                  </span>
+                </button>
+              ))
+            )}
+          </div>
         </div>
 
         {/* Entity list */}
@@ -309,7 +290,7 @@ export function ExportView() {
                   type="checkbox"
                   checked={isSelected}
                   onChange={() => toggleEntity(entity.id)}
-                  className="accent-primary w-3.5 h-3.5 rounded shrink-0"
+                  className="accent-accent w-3.5 h-3.5 rounded shrink-0"
                 />
                 <span className="truncate">
                   {entity.display_name ?? entity.name}
@@ -347,7 +328,7 @@ export function ExportView() {
               max={4}
               value={lod}
               onChange={(e) => setLod(Number(e.target.value))}
-              className="w-full accent-primary h-1.5"
+              className="w-full accent-accent h-1.5"
             />
             <div className="flex justify-between text-[10px] text-text-faint">
               <span>Highest</span>
@@ -369,11 +350,64 @@ export function ExportView() {
               max={6}
               value={mip}
               onChange={(e) => setMip(Number(e.target.value))}
-              className="w-full accent-primary h-1.5"
+              className="w-full accent-accent h-1.5"
             />
             <div className="flex justify-between text-[10px] text-text-faint">
               <span>Full res</span>
               <span>Smallest</span>
+            </div>
+          </div>
+
+          {/* Threads */}
+          <div className="flex flex-col gap-1.5">
+            <div className="flex items-center justify-between">
+              <span className="text-xs text-text-sub">Threads</span>
+              <span className="text-xs text-text-faint tabular-nums">
+                {threads === 0 ? "Auto" : threads}
+              </span>
+            </div>
+            <input
+              type="range"
+              min={0}
+              max={navigator.hardwareConcurrency || 16}
+              value={threads}
+              onChange={(e) => setThreads(Number(e.target.value))}
+              className="w-full accent-accent h-1.5"
+            />
+            <div className="flex justify-between text-[10px] text-text-faint">
+              <span>Auto</span>
+              <span>{navigator.hardwareConcurrency || 16}</span>
+            </div>
+          </div>
+
+          {/* Material Mode */}
+          <div className="flex flex-col gap-1.5">
+            <span className="text-xs text-text-sub">Materials</span>
+            <div className="flex flex-col gap-1">
+              {([
+                { value: "none", label: "None", tip: "Geometry only, no material data. Plain white surfaces." },
+                { value: "colors", label: "Colors", tip: "Palette and layer tint colors applied. No textures. Small file size." },
+                { value: "textures", label: "Textures", tip: "Colors + diffuse, normal, and roughness textures for materials that have them." },
+                { value: "all", label: "All (experimental)", tip: "Everything including heuristic approximations. Layer textures, alpha inference, decal classification. May not be correct." },
+              ] as const).map((opt) => (
+                <label
+                  key={opt.value}
+                  className="flex items-center gap-2 cursor-pointer group"
+                  title={opt.tip}
+                >
+                  <input
+                    type="radio"
+                    name="materialMode"
+                    value={opt.value}
+                    checked={materialMode === opt.value}
+                    onChange={() => setMaterialMode(opt.value)}
+                    className="accent-accent w-3 h-3"
+                  />
+                  <span className="text-xs text-text-sub group-hover:text-text transition-colors">
+                    {opt.label}
+                  </span>
+                </label>
+              ))}
             </div>
           </div>
 
@@ -382,12 +416,12 @@ export function ExportView() {
             <label className="flex items-center gap-2.5 cursor-pointer group">
               <input
                 type="checkbox"
-                checked={includeTextures}
-                onChange={(e) => setIncludeTextures(e.target.checked)}
-                className="accent-primary w-3.5 h-3.5 rounded"
+                checked={includeAttachments}
+                onChange={(e) => setIncludeAttachments(e.target.checked)}
+                className="accent-accent w-3.5 h-3.5 rounded"
               />
               <span className="text-xs text-text-sub group-hover:text-text transition-colors">
-                Include textures
+                Include attachments
               </span>
             </label>
             <label className="flex items-center gap-2.5 cursor-pointer group">
@@ -395,65 +429,10 @@ export function ExportView() {
                 type="checkbox"
                 checked={includeInterior}
                 onChange={(e) => setIncludeInterior(e.target.checked)}
-                className="accent-primary w-3.5 h-3.5 rounded"
+                className="accent-accent w-3.5 h-3.5 rounded"
               />
               <span className="text-xs text-text-sub group-hover:text-text transition-colors">
                 Include interiors
-              </span>
-            </label>
-            <label className="flex items-center gap-2.5 cursor-pointer group">
-              <input
-                type="checkbox"
-                checked={includeNormals}
-                onChange={(e) => setIncludeNormals(e.target.checked)}
-                className="accent-primary w-3.5 h-3.5 rounded"
-              />
-              <span className="text-xs text-text-sub group-hover:text-text transition-colors">
-                Include normals
-              </span>
-            </label>
-            <label className="flex items-center gap-2.5 cursor-pointer group">
-              <input
-                type="checkbox"
-                checked={includeLights}
-                onChange={(e) => setIncludeLights(e.target.checked)}
-                className="accent-primary w-3.5 h-3.5 rounded"
-              />
-              <span className="text-xs text-text-sub group-hover:text-text transition-colors">
-                Include lights
-              </span>
-            </label>
-            <label className="flex items-center gap-2.5 cursor-pointer group">
-              <input
-                type="checkbox"
-                checked={includeTangents}
-                onChange={(e) => setIncludeTangents(e.target.checked)}
-                className="accent-primary w-3.5 h-3.5 rounded"
-              />
-              <span className="text-xs text-text-sub group-hover:text-text transition-colors">
-                Include tangents
-              </span>
-            </label>
-            <label className="flex items-center gap-2.5 cursor-pointer group">
-              <input
-                type="checkbox"
-                checked={includeMaterials}
-                onChange={(e) => setIncludeMaterials(e.target.checked)}
-                className="accent-primary w-3.5 h-3.5 rounded"
-              />
-              <span className="text-xs text-text-sub group-hover:text-text transition-colors">
-                Include materials
-              </span>
-            </label>
-            <label className="flex items-center gap-2.5 cursor-pointer group" title="Apply normal/roughness textures even when UV spaces may not match. Can cause specular noise on some materials.">
-              <input
-                type="checkbox"
-                checked={experimentalTextures}
-                onChange={(e) => setExperimentalTextures(e.target.checked)}
-                className="accent-primary w-3.5 h-3.5 rounded"
-              />
-              <span className="text-xs text-text-sub group-hover:text-text transition-colors">
-                Experimental textures
               </span>
             </label>
           </div>
@@ -515,7 +494,7 @@ export function ExportView() {
               w-full py-2 rounded-md text-xs font-medium transition-colors cursor-pointer
               ${
                 canExport
-                  ? "bg-accent text-bg-deep hover:brightness-110"
+                  ? "bg-accent text-on-accent hover:brightness-110"
                   : "bg-surface text-text-faint cursor-not-allowed"
               }
             `}

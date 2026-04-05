@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -43,97 +43,74 @@ pub enum DirEntryDto {
     Directory { name: String },
 }
 
+/// Info returned after opening a P4k.
+#[derive(Serialize)]
+pub struct P4kInfo {
+    pub entry_count: usize,
+    pub total_bytes: u64,
+}
+
+/// Progress event payload.
 #[derive(Clone, Serialize)]
 pub struct LoadProgress {
     pub fraction: f32,
     pub message: String,
 }
 
-fn settings_path(app: &AppHandle) -> Result<PathBuf, AppError> {
-    let config_dir = app
-        .path()
-        .app_config_dir()
-        .map_err(|e| AppError::Internal(format!("failed to resolve config directory: {e}")))?;
-    Ok(config_dir.join("settings.json"))
+/// System theme palette returned to the frontend.
+#[derive(Serialize)]
+pub struct SystemPalette {
+    pub scheme: String,
+    pub background: String,
+    pub foreground: String,
+    pub accent: String,
+    pub success: String,
+    pub warning: String,
+    pub danger: String,
 }
 
-fn load_settings(app: &AppHandle) -> Result<AppSettings, AppError> {
-    let path = settings_path(app)?;
-    if !path.is_file() {
-        return Ok(AppSettings::default());
-    }
+/// Get the OS system theme (dark/light, accent color, palette).
+#[tauri::command]
+pub fn get_system_theme() -> SystemPalette {
+    let st = system_theme::SystemTheme::new().ok();
+    let theme = st.as_ref().map(|s| s.get_theme());
+    let scheme = st
+        .as_ref()
+        .and_then(|s| s.get_scheme().ok())
+        .unwrap_or(system_theme::ThemeScheme::Dark);
 
-    let bytes = std::fs::read(&path)?;
-    serde_json::from_slice(&bytes).map_err(|e| {
-        AppError::Internal(format!(
-            "failed to parse settings at '{}': {e}",
-            path.display()
-        ))
-    })
-}
-
-fn save_settings(app: &AppHandle, settings: &AppSettings) -> Result<(), AppError> {
-    let path = settings_path(app)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let bytes = serde_json::to_vec_pretty(settings).map_err(|e| {
-        AppError::Internal(format!(
-            "failed to serialize settings for '{}': {e}",
-            path.display()
-        ))
-    })?;
-    std::fs::write(path, bytes)?;
-    Ok(())
-}
-
-fn active_install_root(app: &AppHandle) -> Result<(PathBuf, &'static str), AppError> {
-    let settings = load_settings(app)?;
-    if let Some(path) = settings.install_root {
-        return Ok((path, "custom"));
-    }
-    Ok((
-        PathBuf::from(starbreaker_common::discover::DEFAULT_ROOT),
-        "default",
-    ))
-}
-
-fn discover_from_root(root: &Path) -> Vec<DiscoverResult> {
-    let mut discoveries = Vec::new();
-
-    let direct_p4k = root.join("Data.p4k");
-    if direct_p4k.is_file() {
-        let source = root
-            .file_name()
-            .and_then(|name| name.to_str())
-            .filter(|name| {
-                starbreaker_common::discover::CHANNELS
-                    .iter()
-                    .any(|channel| channel.eq_ignore_ascii_case(name))
-            })
-            .unwrap_or("custom")
-            .to_string();
-
-        discoveries.push(DiscoverResult {
-            path: direct_p4k.to_string_lossy().into_owned(),
-            source,
-        });
-    }
-
-    for &channel in starbreaker_common::discover::CHANNELS {
-        let path = root.join(channel).join("Data.p4k");
-        if path.is_file() {
-            discoveries.push(DiscoverResult {
-                path: path.to_string_lossy().into_owned(),
-                source: channel.to_string(),
-            });
+    if let Some(theme) = theme {
+        let p = &theme.palette;
+        let hex = |c: &system_theme::ThemeColor| {
+            let r = (c.red * 255.0) as u8;
+            let g = (c.green * 255.0) as u8;
+            let b = (c.blue * 255.0) as u8;
+            format!("#{r:02X}{g:02X}{b:02X}")
+        };
+        SystemPalette {
+            scheme: format!("{scheme:?}"),
+            background: hex(&p.background),
+            foreground: hex(&p.foreground),
+            accent: hex(&p.accent),
+            success: hex(&p.success),
+            warning: hex(&p.warning),
+            danger: hex(&p.danger),
+        }
+    } else {
+        // Fallback
+        SystemPalette {
+            scheme: "Dark".into(),
+            background: "#1A1A1A".into(),
+            foreground: "#E2E0E4".into(),
+            accent: "#B07CFF".into(),
+            success: "#5EC77A".into(),
+            warning: "#E8B63A".into(),
+            danger: "#E85454".into(),
         }
     }
-
-    discoveries
 }
 
+/// Discover all Data.p4k installations across channels.
 #[tauri::command]
 pub fn get_install_root(app: AppHandle) -> Result<InstallRootInfo, AppError> {
     let (path, source) = active_install_root(&app)?;
@@ -187,7 +164,7 @@ pub async fn open_p4k(
     app: AppHandle,
     state: State<'_, AppState>,
     path: String,
-) -> Result<usize, AppError> {
+) -> Result<P4kInfo, AppError> {
     let path_clone = path.clone();
     let app_clone = app.clone();
 
@@ -226,7 +203,8 @@ pub async fn open_p4k(
     .await
     .map_err(|e| AppError::Internal(format!("task join error: {e}")))??;
 
-    let count = mapped.len();
+    let entry_count = mapped.len();
+    let total_bytes: u64 = mapped.entries().iter().map(|e| e.uncompressed_size).sum();
     let arc_p4k = Arc::new(mapped);
 
     *state.p4k.lock() = Some(arc_p4k);
@@ -234,7 +212,10 @@ pub async fn open_p4k(
     *state.localization.lock() = loc_map;
     *state.record_index.lock() = Some(record_index);
 
-    Ok(count)
+    Ok(P4kInfo {
+        entry_count,
+        total_bytes,
+    })
 }
 
 /// List only subdirectory names under a path (fast — no file data serialized).
@@ -422,6 +403,7 @@ pub struct ExportProgress {
     pub current: usize,
     pub total: usize,
     pub entity_name: String,
+    pub entity_id: String,
     pub error: Option<String>,
 }
 
@@ -429,22 +411,23 @@ pub struct ExportProgress {
 pub struct ExportDone {
     pub success: usize,
     pub errors: usize,
+    pub succeeded_ids: Vec<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 pub struct ExportRequest {
     pub record_ids: Vec<String>,
     pub names: Vec<String>,
     pub output_dir: String,
     pub lod: u32,
     pub mip: u32,
-    pub include_textures: bool,
+    /// "none", "colors", "textures", "all"
+    pub material_mode: String,
+    /// "glb" or "stl"
+    pub format: String,
+    pub include_attachments: bool,
     pub include_interior: bool,
-    pub include_normals: bool,
-    pub include_lights: bool,
-    pub include_tangents: bool,
-    pub include_materials: bool,
-    pub experimental_textures: bool,
+    pub threads: usize,
 }
 
 /// Start exporting selected entities to GLB files.
@@ -481,17 +464,34 @@ pub async fn start_export(
         .map(|s| s.parse::<CigGuid>())
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
+    let material_mode = match request.material_mode.to_lowercase().as_str() {
+        "none" => starbreaker_gltf::MaterialMode::None,
+        "colors" => starbreaker_gltf::MaterialMode::Colors,
+        "all" => starbreaker_gltf::MaterialMode::All,
+        _ => starbreaker_gltf::MaterialMode::Textures,
+    };
+    let format = match request.format.to_lowercase().as_str() {
+        "stl" => starbreaker_gltf::ExportFormat::Stl,
+        _ => starbreaker_gltf::ExportFormat::Glb,
+    };
     let opts = starbreaker_gltf::ExportOptions {
-        include_textures: request.include_textures,
+        format,
+        material_mode,
+        include_attachments: request.include_attachments,
+        include_interior: request.include_interior,
         texture_mip: request.mip,
         lod_level: request.lod,
-        include_interior: request.include_interior,
-        include_normals: request.include_normals,
-        include_lights: request.include_lights,
-        include_tangents: request.include_tangents,
-        include_materials: request.include_materials,
-        experimental_textures: request.experimental_textures,
     };
+
+    log::info!(
+        "[export] material_mode={:?} format={:?} include_interior={} include_attachments={} lod={} mip={}",
+        opts.material_mode,
+        opts.format,
+        opts.include_interior,
+        opts.include_attachments,
+        opts.lod_level,
+        opts.texture_mip
+    );
 
     let names = request.names;
     let output_dir = request.output_dir;
@@ -505,6 +505,7 @@ pub async fn start_export(
                     ExportDone {
                         success: 0,
                         errors: record_ids.len(),
+                        succeeded_ids: Vec::new(),
                     },
                 );
                 return;
@@ -515,14 +516,21 @@ pub async fn start_export(
         let success = AtomicUsize::new(0);
         let errors = AtomicUsize::new(0);
         let completed = AtomicUsize::new(0);
+        let succeeded_ids: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
-        // Use a dedicated thread pool capped at half the CPU cores to avoid
-        // melting the system — each export is memory-heavy (mesh + DDS + PNG).
-        let num_threads = (std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            / 2)
-        .max(2);
+        // Build string IDs upfront for event payloads.
+        let id_strings: Vec<String> = record_ids.iter().map(|id| id.to_string()).collect();
+
+        // 0 = auto (half cores), otherwise use the requested count.
+        let num_threads = if request.threads > 0 {
+            request.threads
+        } else {
+            (std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                / 2)
+            .max(2)
+        };
         let pool = match rayon::ThreadPoolBuilder::new()
             .num_threads(num_threads)
             .build()
@@ -534,6 +542,7 @@ pub async fn start_export(
                     ExportDone {
                         success: 0,
                         errors: total,
+                        succeeded_ids: Vec::new(),
                     },
                 );
                 eprintln!("failed to build thread pool: {e}");
@@ -546,7 +555,8 @@ pub async fn start_export(
             record_ids
                 .par_iter()
                 .zip(names.par_iter())
-                .for_each(|(record_id, name)| {
+                .zip(id_strings.par_iter())
+                .for_each(|((record_id, name), id_str)| {
                     if cancel.load(Ordering::Relaxed) {
                         return;
                     }
@@ -558,6 +568,7 @@ pub async fn start_export(
                             current: i + 1,
                             total,
                             entity_name: name.clone(),
+                            entity_id: id_str.clone(),
                             error: None,
                         },
                     );
@@ -568,6 +579,7 @@ pub async fn start_export(
                     match export_single(&db, &p4k, record_id, &output_path, &opts) {
                         Ok(()) => {
                             success.fetch_add(1, Ordering::Relaxed);
+                            succeeded_ids.lock().unwrap().push(id_str.clone());
                         }
                         Err(e) => {
                             let _ = app.emit(
@@ -576,6 +588,7 @@ pub async fn start_export(
                                     current: i + 1,
                                     total,
                                     entity_name: name.clone(),
+                                    entity_id: id_str.clone(),
                                     error: Some(format!("{name}: {e}")),
                                 },
                             );
@@ -590,6 +603,7 @@ pub async fn start_export(
             ExportDone {
                 success: success.load(Ordering::Relaxed),
                 errors: errors.load(Ordering::Relaxed),
+                succeeded_ids: succeeded_ids.into_inner().unwrap(),
             },
         );
     });
@@ -629,4 +643,315 @@ fn sanitize_filename(name: &str) -> String {
             _ => c,
         })
         .collect()
+}
+
+/// Generate a GLB preview for a geometry file in the P4K.
+/// Accepts .skin, .skinm, .cgf, .cgfm, .cga, .chr paths.
+/// Companion files (.skinm/.cgfm) are resolved to their primary (.skin/.cgf).
+#[tauri::command]
+pub fn preview_geometry(
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<Vec<u8>, AppError> {
+    let p4k = state
+        .p4k
+        .lock()
+        .as_ref()
+        .ok_or_else(|| AppError::Internal("P4K not loaded".into()))?
+        .clone();
+
+    // Resolve companion: .skinm -> .skin, .cgfm -> .cgf
+    let primary = if path.ends_with('m') && (path.ends_with(".skinm") || path.ends_with(".cgfm")) {
+        path[..path.len() - 1].to_string()
+    } else {
+        path.clone()
+    };
+
+    // Try reading the companion file first (has vertex data), fall back to primary
+    let companion = format!("{primary}m");
+    let data = p4k
+        .read_file(&companion)
+        .or_else(|_| p4k.read_file(&primary))?;
+
+    let glb = starbreaker_gltf::skin_to_glb(&data)?;
+    Ok(glb)
+}
+
+/// Decode a CryXMLB file from the P4K and return it as formatted XML text.
+#[tauri::command]
+pub fn preview_xml(state: tauri::State<'_, AppState>, path: String) -> Result<String, AppError> {
+    let p4k = state
+        .p4k
+        .lock()
+        .as_ref()
+        .ok_or_else(|| AppError::Internal("P4K not loaded".into()))?
+        .clone();
+
+    let data = p4k.read_file(&path)?;
+
+    // Try CryXMLB decode first, fall back to raw UTF-8
+    if starbreaker_cryxml::is_cryxmlb(&data) {
+        let cryxml = starbreaker_cryxml::from_bytes(&data)?;
+        Ok(format!("{cryxml}"))
+    } else {
+        Ok(String::from_utf8_lossy(&data).into_owned())
+    }
+}
+
+/// Read a raw file from the P4K. Used for images (PNG, TGA, etc.) that
+/// don't need server-side decoding.
+#[tauri::command]
+pub fn read_p4k_file(state: tauri::State<'_, AppState>, path: String) -> Result<Vec<u8>, AppError> {
+    let p4k = state
+        .p4k
+        .lock()
+        .as_ref()
+        .ok_or_else(|| AppError::Internal("P4K not loaded".into()))?
+        .clone();
+    Ok(p4k.read_file(&path)?)
+}
+
+/// Progress event for folder extraction.
+#[derive(Clone, Serialize)]
+pub struct FolderExtractProgress {
+    pub current: usize,
+    pub total: usize,
+    pub name: String,
+}
+
+/// Extract all files under a P4k folder path to disk.
+#[tauri::command]
+pub async fn extract_p4k_folder(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    path_prefix: String,
+    output_dir: String,
+    filter: Option<String>,
+) -> Result<usize, AppError> {
+    let p4k = state
+        .p4k
+        .lock()
+        .as_ref()
+        .ok_or_else(|| AppError::Internal("P4K not loaded".into()))?
+        .clone();
+
+    tokio::task::spawn_blocking(move || {
+        let prefix = if path_prefix.ends_with('\\') {
+            path_prefix.clone()
+        } else {
+            format!("{path_prefix}\\")
+        };
+
+        // Parse extension filters (comma-separated, e.g. "mtl,xml")
+        let extensions: Vec<String> = filter
+            .as_deref()
+            .unwrap_or("")
+            .split(',')
+            .map(|s| {
+                let s = s.trim().to_lowercase();
+                if s.starts_with('.') {
+                    s
+                } else {
+                    format!(".{s}")
+                }
+            })
+            .filter(|s| s.len() > 1)
+            .collect();
+
+        let entries: Vec<_> = p4k
+            .entries()
+            .iter()
+            .filter(|e| {
+                if !e.name.starts_with(&prefix) || e.uncompressed_size == 0 {
+                    return false;
+                }
+                if extensions.is_empty() {
+                    return true;
+                }
+                let name_lower = e.name.to_lowercase();
+                extensions
+                    .iter()
+                    .any(|ext| name_lower.ends_with(ext.as_str()))
+            })
+            .collect();
+
+        let count = entries.len();
+        let out = std::path::Path::new(&output_dir);
+
+        for (i, entry) in entries.iter().enumerate() {
+            if i % 50 == 0 || i + 1 == count {
+                let short_name = entry
+                    .name
+                    .rsplit('\\')
+                    .next()
+                    .unwrap_or(&entry.name)
+                    .to_string();
+                let _ = app.emit(
+                    "folder-extract-progress",
+                    FolderExtractProgress {
+                        current: i + 1,
+                        total: count,
+                        name: short_name,
+                    },
+                );
+            }
+            let rel = entry.name.replace('\\', "/");
+            let dest = out.join(&rel);
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let data = p4k.read(entry)?;
+            std::fs::write(&dest, &data)?;
+        }
+
+        Ok::<_, AppError>(count)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("task join error: {e}")))?
+}
+
+/// Metadata returned alongside a DDS preview so the frontend can show mip controls.
+#[derive(serde::Serialize)]
+pub struct DdsPreviewResult {
+    pub png: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub mip_level: usize,
+    pub mip_count: usize,
+}
+
+/// P4K-backed sibling reader for split DDS mip files.
+struct P4kSiblingReader {
+    p4k: std::sync::Arc<starbreaker_p4k::MappedP4k>,
+    base_path: String,
+}
+
+impl starbreaker_dds::ReadSibling for P4kSiblingReader {
+    fn read_sibling(&self, suffix: &str) -> Option<Vec<u8>> {
+        let path = format!("{}{suffix}", self.base_path);
+        self.p4k.read_file(&path).ok()
+    }
+}
+
+/// Decode a DDS texture from the P4K (merging split mip siblings) and return
+/// a specific mip level as PNG bytes along with metadata for mip selection.
+#[tauri::command]
+pub fn preview_dds(
+    state: tauri::State<'_, AppState>,
+    path: String,
+    mip: Option<usize>,
+) -> Result<DdsPreviewResult, AppError> {
+    let p4k = state
+        .p4k
+        .lock()
+        .as_ref()
+        .ok_or_else(|| AppError::Internal("P4K not loaded".into()))?
+        .clone();
+
+    let data = p4k.read_file(&path)?;
+    let sibling_reader = P4kSiblingReader {
+        p4k: p4k.clone(),
+        base_path: path.clone(),
+    };
+    let dds = starbreaker_dds::DdsFile::from_split(&data, &sibling_reader)?;
+
+    if dds.mip_count() == 0 {
+        return Err(AppError::Internal("DDS has no mip data".into()));
+    }
+
+    let mip_level = mip.unwrap_or(0).min(dds.mip_count() - 1);
+    let (width, height) = dds.dimensions(mip_level);
+    let rgba = dds.decode_rgba(mip_level)?;
+
+    let mut png_buf = Vec::new();
+    let encoder = image::codecs::png::PngEncoder::new(&mut png_buf);
+    image::ImageEncoder::write_image(
+        encoder,
+        &rgba,
+        width,
+        height,
+        image::ExtendedColorType::Rgba8,
+    )
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    Ok(DdsPreviewResult {
+        png: png_buf,
+        width,
+        height,
+        mip_level,
+        mip_count: dds.mip_count(),
+    })
+}
+
+/// Save a DDS texture from the P4K as a PNG file to disk.
+#[tauri::command]
+pub fn export_dds_png(
+    state: tauri::State<'_, AppState>,
+    path: String,
+    output_path: String,
+    mip: Option<usize>,
+) -> Result<(), AppError> {
+    let p4k = state
+        .p4k
+        .lock()
+        .as_ref()
+        .ok_or_else(|| AppError::Internal("P4K not loaded".into()))?
+        .clone();
+
+    let data = p4k.read_file(&path)?;
+    let sibling_reader = P4kSiblingReader {
+        p4k: p4k.clone(),
+        base_path: path.clone(),
+    };
+    let dds = starbreaker_dds::DdsFile::from_split(&data, &sibling_reader)?;
+
+    if dds.mip_count() == 0 {
+        return Err(AppError::Internal("DDS has no mip data".into()));
+    }
+
+    let mip_level = mip.unwrap_or(0).min(dds.mip_count() - 1);
+    let (width, height) = dds.dimensions(mip_level);
+    let rgba = dds.decode_rgba(mip_level)?;
+
+    let out = std::path::Path::new(&output_path);
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let file = std::fs::File::create(out)?;
+    let encoder = image::codecs::png::PngEncoder::new(file);
+    image::ImageEncoder::write_image(
+        encoder,
+        &rgba,
+        width,
+        height,
+        image::ExtendedColorType::Rgba8,
+    )
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    Ok(())
+}
+
+/// Extract a single file from the P4K to disk.
+#[tauri::command]
+pub fn extract_p4k_file(
+    state: tauri::State<'_, AppState>,
+    path: String,
+    output_path: String,
+) -> Result<(), AppError> {
+    let p4k = state
+        .p4k
+        .lock()
+        .as_ref()
+        .ok_or_else(|| AppError::Internal("P4K not loaded".into()))?
+        .clone();
+
+    let data = p4k.read_file(&path)?;
+    let out = std::path::Path::new(&output_path);
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(out, &data)?;
+
+    Ok(())
 }

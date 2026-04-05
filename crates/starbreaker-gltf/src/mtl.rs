@@ -15,6 +15,9 @@ pub struct TintPalette {
 #[derive(Debug, Clone)]
 pub struct MtlFile {
     pub materials: Vec<SubMaterial>,
+    /// P4k source path of this .mtl file (e.g. `Data\Objects\Ships\RSI\aurora_mk2\rsi_aurora_mk2_int.mtl`).
+    /// Used for CGF-Converter compatible material naming.
+    pub source_path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -83,7 +86,9 @@ impl SubMaterial {
         let mask = &self.string_gen_mask;
         // Decals use alpha blending for layering on top of hull geometry.
         // MeshDecal shader is always a decal overlay, even without %DECAL flag.
-        if mask.contains("%DECAL") || mask.contains("STENCIL_MAP") || self.shader == "MeshDecal" {
+        // Note: STENCIL_MAP on non-MeshDecal shaders (e.g. HardSurface camo paints)
+        // is for the stencil pattern system, NOT alpha blending — don't treat as decal.
+        if mask.contains("%DECAL") || self.shader == "MeshDecal" {
             return AlphaConfig::Blend;
         }
         if self.alpha_test > 0.0 {
@@ -108,10 +113,14 @@ impl SubMaterial {
         {
             return true;
         }
-        // Decals without a diffuse texture AND without vertex colors have no alpha source —
-        // they'd render as solid colored rectangles covering the hull.
-        if self.is_decal() && self.diffuse_tex.is_none() && !mask.contains("%VERTCOLORS") {
-            return true;
+        // Decals without a diffuse texture need some alpha source to look correct.
+        // STENCIL_MAP decals get their pattern from $TintPaletteDecal (a virtual texture
+        // we can't resolve) — hide them even if they have vertex colors.
+        // Other decals without diffuse need vertex colors for alpha.
+        if self.is_decal() && self.diffuse_tex.is_none() {
+            if mask.contains("STENCIL_MAP") || !mask.contains("%VERTCOLORS") {
+                return true;
+            }
         }
         false
     }
@@ -119,7 +128,7 @@ impl SubMaterial {
     /// Whether this material is a decal overlay (needs alpha texture to look correct).
     pub fn is_decal(&self) -> bool {
         let mask = &self.string_gen_mask;
-        mask.contains("%DECAL") || mask.contains("STENCIL_MAP") || self.shader == "MeshDecal"
+        mask.contains("%DECAL") || self.shader == "MeshDecal"
     }
 
     /// Whether this material uses a glass shader (GlassPBR).
@@ -132,9 +141,32 @@ impl SubMaterial {
     /// CryEngine Shininess (0-255) = smoothness. The GBuffer stores
     /// "Gloss/smoothness" and EFTT_SMOOTHNESS maps to the `_ddna` alpha channel.
     /// Roughness = 1.0 - smoothness, where smoothness = shininess / 255.
+    ///
+    /// HardSurface, LayerBlend, and Illum shaders typically set Shininess=255 as a
+    /// placeholder because they derive per-pixel smoothness from the `_ddna` alpha
+    /// channel. Without per-pixel smoothness texture data, the literal 0.0 roughness
+    /// creates an unrealistic mirror finish. Use a default of 0.5 for these shaders.
     pub fn roughness(&self) -> f32 {
         let smoothness = (self.shininess / 255.0).clamp(0.0, 1.0);
-        1.0 - smoothness
+        let roughness = 1.0 - smoothness;
+        // Shaders that use per-pixel smoothness set Shininess=255 as a placeholder.
+        // Without the _ddna texture, this produces roughness=0 (mirror). Use a
+        // reasonable default instead.
+        if roughness == 0.0 && self.uses_per_pixel_smoothness() {
+            0.5
+        } else {
+            roughness
+        }
+    }
+
+    /// Whether this material's shader derives smoothness from a texture rather than
+    /// the scalar Shininess value.
+    fn uses_per_pixel_smoothness(&self) -> bool {
+        let s = self.shader.to_lowercase();
+        s.contains("hardsurface")
+            || s.contains("layerblend")
+            || s == "illum"
+            || s == "glasspbr"
     }
 
     /// glTF metallic factor derived from material name.
@@ -188,7 +220,7 @@ impl SubMaterial {
 
     pub fn is_double_sided(&self) -> bool {
         let mask = &self.string_gen_mask;
-        mask.contains("%DECAL") || mask.contains("STENCIL_MAP") || self.shader == "MeshDecal"
+        mask.contains("%DECAL") || self.shader == "MeshDecal"
     }
 }
 
@@ -209,7 +241,7 @@ pub fn parse_mtl(data: &[u8]) -> Result<MtlFile, Error> {
         vec![parse_sub_material(&xml, root)]
     };
 
-    Ok(MtlFile { materials })
+    Ok(MtlFile { materials, source_path: None })
 }
 
 fn parse_sub_material(

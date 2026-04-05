@@ -18,6 +18,9 @@ starbreaker-datacore = { path = "../../crates/starbreaker-datacore" }
 starbreaker-gltf = { path = "../../crates/starbreaker-gltf" }
 starbreaker-wwise = { path = "../../crates/starbreaker-wwise" }
 starbreaker-wem = { path = "../../crates/starbreaker-wem" }
+starbreaker-cryxml = { path = "../../crates/starbreaker-cryxml" }
+starbreaker-dds = { path = "../../crates/starbreaker-dds" }
+image = { version = "0.25", default-features = false, features = ["png"] }
 tokio = { version = "1", features = ["rt"] }
 rayon = "1"
 tauri-plugin-updater = "2"
@@ -25,3 +28,7 @@ tauri-plugin-process = "2"
 parking_lot = { workspace = true }
 thiserror = "2"
 log = "0.4"
+tauri-plugin-log = "2"
+tauri-plugin-store = "2"
+system-theme = "0.3"
+futures-lite = "2"
