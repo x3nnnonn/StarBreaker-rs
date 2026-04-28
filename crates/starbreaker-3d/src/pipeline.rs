@@ -1,7 +1,10 @@
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
+use starbreaker_common::progress::{report as report_progress, Progress};
 use starbreaker_datacore::database::Database;
 use starbreaker_datacore::error::QueryError;
+use starbreaker_datacore::query::value::Value;
 use starbreaker_datacore::types::Record;
 use starbreaker_dds::{DdsFile, ReadSibling};
 use starbreaker_p4k::MappedP4k;
@@ -9,7 +12,7 @@ use starbreaker_p4k::MappedP4k;
 use crate::error::Error;
 use crate::mtl;
 use crate::nmc;
-use crate::types::MaterialTextures;
+use crate::types::{MaterialTextures, TextureTransformInfo};
 
 /// Bundled result of extracting an entity's mesh data from the P4k archive.
 type EntityPayload = (
@@ -21,7 +24,20 @@ type EntityPayload = (
     String,
     String,
     Vec<crate::skeleton::Bone>,
+    Option<String>,
 );
+
+type InteriorMeshAsset = (
+    crate::Mesh,
+    Option<mtl::MtlFile>,
+    Option<nmc::NodeMeshCombo>,
+);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PreloadedTextureKey {
+    material_source: String,
+    palette_hash: u64,
+}
 
 /// How materials are represented in the export.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +56,15 @@ pub enum MaterialMode {
     All,
 }
 
+/// Top-level export kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportKind {
+    /// Bundled scene export using a single-file artifact such as GLB.
+    Bundled,
+    /// Decomposed scene export using reusable assets and sidecar metadata.
+    Decomposed,
+}
+
 /// Output format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportFormat {
@@ -52,6 +77,8 @@ pub enum ExportFormat {
 /// Options for controlling the export pipeline.
 #[derive(Debug, Clone)]
 pub struct ExportOptions {
+    /// Top-level export kind.
+    pub kind: ExportKind,
     /// Output format.
     pub format: ExportFormat,
     /// Material detail level.
@@ -62,22 +89,42 @@ pub struct ExportOptions {
     pub include_interior: bool,
     /// Include lights from interior object containers (KHR_lights_punctual).
     pub include_lights: bool,
+    /// Include NoDraw submeshes and sidecar entries in decomposed exports.
+    pub include_nodraw: bool,
+    /// Include shield helper meshes and shield attachments.
+    pub include_shields: bool,
     /// LOD level (0 = highest detail, 1+ = lower).
     pub lod_level: u32,
     /// Texture mip level (0 = full resolution, 2 = 1/4 res, 4 = 1/16 res).
     pub texture_mip: u32,
+    /// Export animation clips into decomposed scene sidecars.
+    pub include_animations: bool,
+    /// Apply default-state animation poses (e.g. landing-gear-deployed) to
+    /// skeletons that ship a `.chrparams` file. Affects the rest pose written
+    /// into the GLB / decomposed skeleton data.
+    pub apply_default_animation_pose: bool,
+    /// Animation event tags (chrparams `<Animation name="…"/>`) to look up
+    /// when `apply_default_animation_pose` is enabled. The first match wins
+    /// per skeleton. Default: `landing_gear_extend`.
+    pub default_animation_tags: Vec<String>,
 }
 
 impl Default for ExportOptions {
     fn default() -> Self {
         Self {
+            kind: ExportKind::Bundled,
             format: ExportFormat::Glb,
             material_mode: MaterialMode::Textures,
             include_attachments: true,
             include_interior: true,
             include_lights: true,
+            include_nodraw: false,
+            include_shields: false,
             lod_level: 1,
             texture_mip: 2,
+            include_animations: false,
+            apply_default_animation_pose: true,
+            default_animation_tags: vec!["landing_gear_extend".to_string()],
         }
     }
 }
@@ -106,14 +153,78 @@ impl ExportFormat {
     }
 }
 
-/// Result of exporting an entity record to GLB.
+/// Placeholder for a future decomposed export package.
+#[derive(Debug, Clone, Default)]
+pub struct DecomposedExport {
+    pub files: Vec<ExportedFile>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportedFileKind {
+    PackageManifest,
+    MaterialSidecar,
+    MeshAsset,
+    TextureAsset,
+}
+
+impl ExportedFileKind {
+    pub fn is_mesh_or_texture_asset(self) -> bool {
+        matches!(self, Self::MeshAsset | Self::TextureAsset)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ExportedFile {
+    pub relative_path: String,
+    pub bytes: Vec<u8>,
+    pub kind: ExportedFileKind,
+}
+
+/// Result of exporting an entity record.
 pub struct ExportResult {
-    /// The GLB binary data.
+    /// The top-level export kind used for this result.
+    pub kind: ExportKind,
+    /// The requested bundled output format when `kind` is `Bundled`.
+    pub format: ExportFormat,
+    /// The bundled artifact bytes for the current export path.
+    ///
+    /// This remains named `glb` for compatibility with the existing bundled API.
     pub glb: Vec<u8>,
+    /// Placeholder for future decomposed results.
+    pub decomposed: Option<DecomposedExport>,
     /// The geometry file path from DataCore (e.g., "objects/ships/aegs/aegs_gladius.skin").
     pub geometry_path: String,
     /// The material file path from DataCore (e.g., "objects/ships/aegs/aegs_gladius.mtl").
     pub material_path: String,
+}
+
+impl ExportResult {
+    pub fn bundled_bytes(&self) -> Option<&[u8]> {
+        if self.kind == ExportKind::Bundled && !self.glb.is_empty() {
+            Some(self.glb.as_slice())
+        } else {
+            None
+        }
+    }
+}
+
+fn ensure_supported_export_kind(opts: &ExportOptions) -> Result<(), Error> {
+    match opts.kind {
+        ExportKind::Bundled | ExportKind::Decomposed => Ok(()),
+    }
+}
+
+fn ensure_supported_export_format(opts: &ExportOptions) -> Result<(), Error> {
+    if opts.format == ExportFormat::Glb {
+        Ok(())
+    } else {
+        Err(Error::UnsupportedExportFormat(format!("{:?}", opts.format)))
+    }
+}
+
+fn ensure_supported_export_options(opts: &ExportOptions) -> Result<(), Error> {
+    ensure_supported_export_kind(opts)?;
+    ensure_supported_export_format(opts)
 }
 
 /// Export a single entity's mesh, materials, textures, NMC, and palette from DataCore + P4k.
@@ -173,15 +284,32 @@ fn export_entity_payload_cached(
         .query_single::<String>(&mtl_compiled, record)?
         .unwrap_or_default();
 
-    let (mesh, mtl_file, textures, nmc, skeleton_bones, primary_path) =
+    let (
+        mesh,
+        mtl_file,
+        textures,
+        nmc,
+        skeleton_bones,
+        primary_path,
+        skeleton_source_path,
+    ) =
         load_geometry_parts(p4k, &geometry_path, &material_path, opts, png_cache, false)?;
 
     if !opts.material_mode.include_materials() {
-        return Ok((mesh, None, None, nmc, None, primary_path, material_path, skeleton_bones));
+        return Ok((
+            mesh,
+            None,
+            None,
+            nmc,
+            None,
+            primary_path,
+            material_path,
+            skeleton_bones,
+            skeleton_source_path,
+        ));
     }
 
     let palette = query_tint_palette(db, record);
-
     Ok((
         mesh,
         mtl_file,
@@ -191,6 +319,7 @@ fn export_entity_payload_cached(
         primary_path,
         material_path,
         skeleton_bones,
+        skeleton_source_path,
     ))
 }
 
@@ -212,18 +341,38 @@ fn export_entity_from_paths_cached(
     png_cache: &mut PngCache,
     use_model_bbox: bool,
 ) -> Result<EntityPayload, Error> {
-    let (mesh, mtl_file, textures, nmc, _skeleton_bones, primary_path) =
+    let (mesh, mtl_file, textures, nmc, skeleton_bones, primary_path, skeleton_source_path) =
         load_geometry_parts(p4k, geometry_path, material_path, opts, png_cache, use_model_bbox)?;
 
     if !opts.material_mode.include_materials() {
-        return Ok((mesh, None, None, nmc, None, primary_path, material_path.to_string(), Vec::new()));
+        return Ok((
+            mesh,
+            None,
+            None,
+            nmc,
+            None,
+            primary_path,
+            material_path.to_string(),
+            skeleton_bones,
+            skeleton_source_path,
+        ));
     }
 
-    Ok((mesh, mtl_file, textures, nmc, None, primary_path, material_path.to_string(), Vec::new()))
+    Ok((
+        mesh,
+        mtl_file,
+        textures,
+        nmc,
+        None,
+        primary_path,
+        material_path.to_string(),
+        skeleton_bones,
+        skeleton_source_path,
+    ))
 }
 
 /// Shared geometry loading: resolve parts, load skeleton, load + merge meshes.
-/// Returns (mesh, mtl, textures, nmc, skeleton_bones, primary_path).
+/// Returns (mesh, mtl, textures, nmc, skeleton_bones, primary_path, skeleton_source_path).
 fn load_geometry_parts(
     p4k: &MappedP4k,
     geometry_path: &str,
@@ -238,18 +387,41 @@ fn load_geometry_parts(
     Option<nmc::NodeMeshCombo>,
     Vec<crate::skeleton::Bone>,
     String,
+    Option<String>,
 ), Error> {
     let resolved = resolve_geometry_files(p4k, geometry_path)?;
     let primary_path = resolved.parts[0].path.clone();
+    let skeleton_source_path = skeleton_source_paths(resolved.skeleton_path.as_deref(), &primary_path)
+        .first()
+        .map(|path| (*path).to_string());
 
-    let skeleton_bones = load_skeleton(p4k, resolved.skeleton_path.as_deref());
+    let mut skeleton_bones = load_skeleton(p4k, resolved.skeleton_path.as_deref(), &primary_path);
+
+    if opts.apply_default_animation_pose && !skeleton_bones.is_empty() {
+        for path in skeleton_source_paths(resolved.skeleton_path.as_deref(), &primary_path) {
+            let updated = apply_default_animation_pose_for_skel(p4k, path, &mut skeleton_bones, opts);
+            if updated > 0 {
+                log::info!(
+                    "[anim] applied default pose to {updated} bone(s) for skeleton {path}"
+                );
+                break;
+            }
+        }
+    }
 
     let effective_material = resolved.parts[0]
         .material_override
         .as_deref()
         .unwrap_or(material_path);
-    let (mut mesh, mtl_file, textures, nmc) =
+    let (mut mesh, mtl_file, textures, mut nmc) =
         load_single_mesh(p4k, &primary_path, effective_material, opts, png_cache, use_model_bbox)?;
+
+    if nmc.is_none() {
+        nmc = synthesize_nmc_from_bones(&mesh, &skeleton_bones);
+        if nmc.is_some() {
+            rebase_mesh_submeshes_to_bone_space(&mut mesh, &skeleton_bones);
+        }
+    }
 
     // Merge additional parts (CA_BONE/CA_SKIN attachments from CDF).
     let no_tex_opts = ExportOptions { material_mode: MaterialMode::Colors, ..opts.clone() };
@@ -267,17 +439,144 @@ fn load_geometry_parts(
         }
     }
 
-    Ok((mesh, mtl_file, textures, nmc, skeleton_bones, primary_path))
+    Ok((
+        mesh,
+        mtl_file,
+        textures,
+        nmc,
+        skeleton_bones,
+        primary_path,
+        skeleton_source_path,
+    ))
 }
 
 /// Load skeleton bones from a .chr path. Returns empty vec if path is None or load fails.
-fn load_skeleton(p4k: &MappedP4k, skel_path: Option<&str>) -> Vec<crate::skeleton::Bone> {
-    let Some(skel_path) = skel_path else { return Vec::new() };
-    let p4k_skel = datacore_path_to_p4k(skel_path);
-    p4k.entry_case_insensitive(&p4k_skel)
+fn skeleton_source_paths<'a>(skel_path: Option<&'a str>, geometry_path: &'a str) -> Vec<&'a str> {
+    let mut paths = Vec::new();
+    if let Some(path) = skel_path.filter(|path| !path.is_empty()) {
+        paths.push(path);
+    }
+    if !geometry_path.is_empty()
+        && !paths
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(geometry_path))
+    {
+        paths.push(geometry_path);
+    }
+    paths
+}
+
+/// Load skeleton bones from an explicit `.chr` path, falling back to the primary geometry.
+/// Direct `.skin` assets can carry inline CompiledBones chunks without a companion skeleton.
+fn load_skeleton(
+    p4k: &MappedP4k,
+    skel_path: Option<&str>,
+    geometry_path: &str,
+) -> Vec<crate::skeleton::Bone> {
+    for path in skeleton_source_paths(skel_path, geometry_path) {
+        let p4k_path = datacore_path_to_p4k(path);
+        if let Some(bones) = p4k
+            .entry_case_insensitive(&p4k_path)
+            .and_then(|entry| p4k.read(entry).ok())
+            .and_then(|data| crate::skeleton::parse_skeleton(&data))
+        {
+            return bones;
+        }
+    }
+    Vec::new()
+}
+
+/// Look up a `.chrparams` for the given skeleton path, find an animation
+/// matching one of `opts.default_animation_tags`, and bake its final-frame
+/// pose into `bones`. Returns the number of bones updated (0 = nothing
+/// applied / chrparams missing / animation missing).
+fn apply_default_animation_pose_for_skel(
+    p4k: &MappedP4k,
+    skel_path: &str,
+    bones: &mut [crate::skeleton::Bone],
+    opts: &ExportOptions,
+) -> usize {
+    // Derive the .chrparams path: replace .chr/.skin extension with .chrparams.
+    let chrparams_path = match swap_extension(skel_path, "chrparams") {
+        Some(p) => p,
+        None => return 0,
+    };
+    let p4k_path = datacore_path_to_p4k(&chrparams_path);
+    let bytes = match p4k
+        .entry_case_insensitive(&p4k_path)
         .and_then(|entry| p4k.read(entry).ok())
-        .and_then(|data| crate::skeleton::parse_skeleton(&data))
-        .unwrap_or_default()
+    {
+        Some(b) => b,
+        None => return 0,
+    };
+    let cp = match crate::chrparams::ChrParams::from_bytes(&bytes) {
+        Ok(cp) => cp,
+        Err(e) => {
+            log::warn!("[anim] failed to parse {chrparams_path}: {e}");
+            return 0;
+        }
+    };
+    // Pick the first matching animation tag.
+    let mut tag_match: Option<(&str, String)> = None;
+    for tag in &opts.default_animation_tags {
+        if let Some(p) = cp.animations.get(tag) {
+            tag_match = Some((tag.as_str(), cp.resolved_caf_path(p)));
+            break;
+        }
+    }
+    let (_tag, _caf_path) = match tag_match {
+        Some(t) => t,
+        None => return 0,
+    };
+    // We need the .dba ($TracksDatabase). The .caf is a hint that the right
+    // bone subset will live in some DBA block; we don't open the .caf.
+    let dba_path = match cp.tracks_database.as_deref() {
+        Some(p) => p,
+        None => return 0,
+    };
+    let dba_p4k = datacore_path_to_p4k(dba_path);
+    let dba_bytes = match p4k
+        .entry_case_insensitive(&dba_p4k)
+        .and_then(|entry| p4k.read(entry).ok())
+    {
+        Some(b) => b,
+        None => {
+            log::warn!("[anim] tracks database not found: {dba_path}");
+            return 0;
+        }
+    };
+    let db = match crate::animation::parse_dba(&dba_bytes) {
+        Ok(d) => d,
+        Err(e) => {
+            log::warn!("[anim] failed to parse {dba_path}: {e}");
+            return 0;
+        }
+    };
+    // Skeleton bone-hash set for signature matching.
+    let skel_hashes: std::collections::HashSet<u32> = bones
+        .iter()
+        .map(|b| crate::animation::bone_name_hash(&b.name))
+        .collect();
+    let clip = match crate::animation::find_block_for_skeleton(&db, &skel_hashes, true) {
+        Some(c) => c,
+        None => return 0,
+    };
+    let pose = crate::animation::clip_final_pose(clip);
+    crate::animation::apply_pose_to_skeleton(bones, &pose)
+}
+
+/// Replace the file extension of `path` with `new_ext` (no leading dot).
+/// Returns `None` if `path` has no extension.
+fn swap_extension(path: &str, new_ext: &str) -> Option<String> {
+    let dot = path.rfind('.')?;
+    let slash = path.rfind(|c: char| c == '/' || c == '\\').unwrap_or(0);
+    if dot < slash {
+        return None;
+    }
+    let mut out = String::with_capacity(dot + 1 + new_ext.len());
+    out.push_str(&path[..dot + 1]);
+    out.push_str(new_ext);
+    Some(out)
 }
 
 /// Export an entity with its loadout tree as a single GLB.
@@ -293,54 +592,137 @@ pub fn assemble_glb_with_loadout(
     tree: &starbreaker_datacore::loadout::LoadoutTree,
     opts: &ExportOptions,
 ) -> Result<ExportResult, Error> {
+    assemble_glb_with_loadout_with_progress(db, p4k, record, tree, opts, None, None)
+}
+
+pub fn assemble_glb_with_loadout_with_progress(
+    db: &Database,
+    p4k: &MappedP4k,
+    record: &Record,
+    tree: &starbreaker_datacore::loadout::LoadoutTree,
+    opts: &ExportOptions,
+    progress: Option<&Progress>,
+    existing_asset_paths: Option<&HashSet<String>>,
+) -> Result<ExportResult, Error> {
+    ensure_supported_export_options(opts)?;
+
     use crate::types::EntityPayload;
 
+    report_progress(progress, 0.02, "Resolving loadout");
+    let payload_material_mode = if opts.kind == ExportKind::Decomposed {
+        MaterialMode::Colors
+    } else {
+        opts.material_mode
+    };
+    let payload_opts = ExportOptions {
+        material_mode: payload_material_mode,
+        ..opts.clone()
+    };
+
     log::info!("[mem-pipeline] resolving loadout meshes...");
-    let resolved = resolve_loadout_meshes(db, p4k, record, tree, opts)?;
+    let resolved = resolve_loadout_meshes(db, p4k, record, tree, &payload_opts)?;
     log::info!("[mem-pipeline] resolved: {} children", resolved.children.len());
+    report_progress(progress, 0.14, "Exporting root mesh");
+    let localization = load_localization_map(p4k);
+    let paint_display_names = build_paint_display_name_map(db, &localization);
 
     // Export root entity (mesh + textures).
-    let (root_mesh, root_mtl, root_tex, _, root_palette, geometry_path, material_path, root_bones) =
-        export_entity_payload(db, p4k, record, opts)?;
+    let (
+        root_mesh,
+        root_mtl,
+        root_tex,
+        _,
+        mut root_palette,
+        geometry_path,
+        material_path,
+        root_bones,
+        root_skeleton_source_path,
+    ) = export_entity_payload(db, p4k, record, &payload_opts)?;
+    let root_animation_controller = query_animation_controller_source(db, record);
+    if let Some(palette) = root_palette.as_mut() {
+        populate_palette_display_name(palette, &paint_display_names);
+    }
+    let default_root_palette = root_palette.clone();
     log::info!("[mem-pipeline] root exported: {} verts", root_mesh.positions.len());
 
     // Check for equipped paint item and resolve its SubGeometry palette/material override.
-    let (root_palette, root_mtl) = resolve_paint_override(
-        db, p4k, record, &tree.root, root_palette, root_mtl, opts,
+    let (mut root_palette, root_mtl) = resolve_paint_override(
+        db, p4k, record, &tree.root, root_palette, root_mtl,
     );
+    if let Some(palette) = root_palette.as_mut() {
+        populate_palette_display_name(palette, &paint_display_names);
+    }
 
     // Load landing gear as separate child entities attached to NMC nodes.
     // Landing gear CDF geometry attaches to NMC helper bones (e.g. hardpoint_landing_gear_front).
     // Adding them as EntityPayloads lets the existing scene graph handle positioning.
     // Children skip textures to save memory, but never exceed the user's material mode.
+    let child_payload_material_mode = if opts.kind == ExportKind::Decomposed {
+        MaterialMode::Colors
+    } else {
+        opts.material_mode
+    };
     let child_material_mode = match opts.material_mode {
+        _ if opts.kind == ExportKind::Decomposed => MaterialMode::Colors,
         MaterialMode::None => MaterialMode::None,
         _ => MaterialMode::Colors,
     };
     let child_opts = ExportOptions {
         material_mode: child_material_mode,
-        ..opts.clone()
+        ..payload_opts.clone()
     };
     let gear_parts = query_landing_gear(db, record);
     let mut child_payloads: Vec<EntityPayload> = Vec::new();
+    report_progress(progress, 0.28, "Flattening attachments");
     if opts.include_attachments {
         for (gear_path, bone_name) in &gear_parts {
             match export_entity_from_paths(p4k, gear_path, "", &child_opts) {
-                Ok((gear_mesh, gear_mtl, _, gear_nmc, _, _, _, _)) => {
+                Ok((
+                    gear_mesh,
+                    gear_mtl,
+                    _,
+                    gear_nmc,
+                    _,
+                    gear_geometry_path,
+                    gear_material_path,
+                    gear_bones,
+                    gear_skeleton_source_path,
+                )) => {
                     let verts = gear_mesh.positions.len();
+                    let textures = if child_payload_material_mode.include_textures() {
+                        gear_mtl.as_ref().map(|materials| {
+                            let mut png_cache = PngCache::new();
+                            load_material_textures(
+                                p4k,
+                                materials,
+                                root_palette.as_ref(),
+                                opts.texture_mip,
+                                &mut png_cache,
+                                child_payload_material_mode.include_normals(),
+                                child_payload_material_mode.experimental(),
+                            )
+                        })
+                    } else {
+                        None
+                    };
                     child_payloads.push(EntityPayload {
                         mesh: gear_mesh,
                         materials: gear_mtl,
-                        textures: None,
+                        textures,
                         nmc: gear_nmc,
                         palette: root_palette.clone(),
-                        bones: Vec::new(),
+                        geometry_path: gear_geometry_path,
+                        material_path: gear_material_path,
+                        bones: gear_bones,
+                        skeleton_source_path: gear_skeleton_source_path,
                         entity_name: gear_path.rsplit('/').next().unwrap_or(gear_path).to_string(),
                         parent_node_name: bone_name.clone(),
                         parent_entity_name: resolved.entity_name.clone(),
                         no_rotation: false,
                         offset_position: [0.0; 3],
                         offset_rotation: [0.0; 3],
+                        detach_direction: [0.0; 3],
+                        port_flags: String::new(),
                     });
                     log::info!("  landing gear '{gear_path}' → '{bone_name}', {verts} verts");
                 }
@@ -354,11 +736,14 @@ pub fn assemble_glb_with_loadout(
             db,
             p4k,
             &child_opts,
+            child_payload_material_mode,
+            existing_asset_paths,
             &mut child_payloads,
         );
     }
     let total_child_verts: usize = child_payloads.iter().map(|c| c.mesh.positions.len()).sum();
     log::info!("[mem-pipeline] flattened: {} payloads, {} total verts", child_payloads.len(), total_child_verts);
+    report_progress(progress, 0.42, "Discovering interiors");
 
     // Interior discovery (no mesh loading — JIT during GLB packing).
     let loaded_interiors = if opts.include_interior && !opts.format.is_stl() {
@@ -378,55 +763,153 @@ pub fn assemble_glb_with_loadout(
         loaded_interiors.unique_cgfs.len()
     );
 
-    // Texture loading callback: called JIT per entity during GLB packing.
+    let mut preloaded_interior_meshes = if opts.kind == ExportKind::Bundled {
+        preload_interior_meshes(&loaded_interiors, p4k, &child_opts)
+    } else {
+        Vec::new()
+    };
+    if !preloaded_interior_meshes.is_empty() {
+        log::info!(
+            "[mem-pipeline] preloaded interior meshes: {}/{}",
+            preloaded_interior_meshes
+                .iter()
+                .filter(|asset| asset.is_some())
+                .count(),
+            preloaded_interior_meshes.len()
+        );
+    }
+    let preloaded_interior_textures = if opts.kind == ExportKind::Bundled {
+        preload_interior_textures(
+            &loaded_interiors,
+            &preloaded_interior_meshes,
+            root_palette.as_ref(),
+            p4k,
+            opts,
+        )
+    } else {
+        std::collections::HashMap::new()
+    };
+    if !preloaded_interior_textures.is_empty() {
+        log::info!(
+            "[mem-pipeline] preloaded interior texture sets: {}",
+            preloaded_interior_textures.len()
+        );
+    }
+    report_progress(progress, 0.60, if opts.kind == ExportKind::Decomposed {
+        "Building structured package"
+    } else {
+        "Packing GLB"
+    });
+    let preloaded_interior_mesh_indices: std::collections::HashMap<String, usize> =
+        loaded_interiors
+            .unique_cgfs
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (entry.cgf_path.clone(), index))
+            .collect();
+
+    // Texture loading callback: root/child entities fall back to the normal JIT
+    // path, while bundled interior meshes can consume preloaded texture sets.
     let mut png_cache = PngCache::new();
-    let mut tex_loader: Box<dyn FnMut(Option<&crate::mtl::MtlFile>) -> Option<MaterialTextures>> =
+    let mut tex_loader: Box<
+        dyn FnMut(
+            Option<&crate::mtl::MtlFile>,
+            Option<&crate::mtl::TintPalette>,
+        ) -> Option<MaterialTextures>,
+    > =
         if !opts.material_mode.include_textures() {
-            Box::new(|_| None)
+            Box::new(|_, _| None)
         } else {
             let mip = opts.texture_mip;
             let include_normals = opts.material_mode.include_normals();
             let experimental_textures = opts.material_mode.experimental();
-            Box::new(move |mtl: Option<&crate::mtl::MtlFile>| {
-                mtl.map(|m| load_material_textures(p4k, m, mip, &mut png_cache, include_normals, experimental_textures))
+            Box::new(move |mtl: Option<&crate::mtl::MtlFile>, palette: Option<&crate::mtl::TintPalette>| {
+                if let Some(material_source) = mtl.and_then(|materials| materials.source_path.as_ref()) {
+                    let cache_key = PreloadedTextureKey {
+                        material_source: material_source.to_ascii_lowercase(),
+                        palette_hash: tint_palette_hash(palette),
+                    };
+                    if let Some(textures) = preloaded_interior_textures.get(&cache_key).cloned() {
+                        return Some(textures);
+                    }
+                }
+
+                mtl.map(|m| {
+                    load_material_textures(
+                        p4k,
+                        m,
+                        palette,
+                        mip,
+                        &mut png_cache,
+                        include_normals,
+                        experimental_textures,
+                    )
+                })
             })
         };
 
-    // Interior mesh loader: called JIT per unique CGF during GLB packing.
     let mut interior_png_cache = PngCache::new();
-    // Interior CGFs: bake NMC transforms only when the scaling bbox differs from
-    // the model bbox (indicating multi-node vertex quantization). Use absolute
-    // world transforms (no root_inv) because root + child rotations cancel in
-    // the assembled model. When bboxes match, vertices are already correct.
+    // Bundled GLB exports preload unique interior CGFs in parallel, then fall
+    // back to on-demand loading for any cache misses and for decomposed exports.
     let mut interior_mesh_loader =
         |entry: &crate::pipeline::InteriorCgfEntry| -> Option<(crate::Mesh, Option<mtl::MtlFile>, Option<crate::nmc::NodeMeshCombo>)> {
-            match export_cgf_from_path(
-                p4k,
-                &entry.cgf_path,
-                entry.material_path.as_deref(),
-                &child_opts,
-                &mut interior_png_cache,
-                false,
-            ) {
-                Ok((mesh, mtl, _tex, nmc, _palette, _, _, _bones)) => {
-                    let needs_bake = mesh.scaling_min.iter().zip(&mesh.model_min)
-                        .chain(mesh.scaling_max.iter().zip(&mesh.model_max))
-                        .any(|(s, m)| (s - m).abs() > 0.01);
-                    let mesh = if needs_bake {
-                        bake_nmc_into_mesh(mesh, nmc.as_ref(), false)
-                    } else {
-                        mesh
-                    };
-                    Some((mesh, mtl, nmc))
-                }
-                Err(e) => {
-                    log::warn!("failed to load CGF {}: {e}", entry.cgf_path);
-                    None
+            if let Some(&index) = preloaded_interior_mesh_indices.get(&entry.cgf_path) {
+                if let Some(asset) = preloaded_interior_meshes
+                    .get_mut(index)
+                    .and_then(Option::take)
+                {
+                    return Some(asset);
                 }
             }
+
+            load_interior_mesh_asset(p4k, entry, &child_opts, &mut interior_png_cache)
         };
 
-    let glb = crate::gltf::write_glb(
+    if opts.kind == ExportKind::Decomposed {
+        let mut available_palettes = query_related_tint_palettes(db, record, default_root_palette.as_ref());
+        for palette in &mut available_palettes {
+            populate_palette_display_name(palette, &paint_display_names);
+        }
+        let paint_variants = enumerate_paint_variants_for_entity(db, p4k, record, &paint_display_names);
+        let decomposed_progress = progress.map(|progress| progress.sub(0.60, 0.90));
+        let decomposed = crate::decomposed::write_decomposed_export(
+            p4k,
+            crate::decomposed::DecomposedInput {
+                entity_name: resolved.entity_name.clone(),
+                geometry_path: geometry_path.clone(),
+                material_path: material_path.clone(),
+                root_mesh,
+                root_materials: root_mtl,
+                root_nmc: resolved.nmc,
+                root_palette: root_palette.clone(),
+                available_palettes,
+                root_bones,
+                root_skeleton_source_path,
+                root_animation_controller,
+                children: child_payloads,
+                interiors: loaded_interiors,
+                paint_variants,
+            },
+            opts,
+            decomposed_progress.as_ref(),
+            existing_asset_paths,
+            &mut interior_mesh_loader,
+        )?;
+
+        report_progress(progress, 0.90, "Writing structured package");
+
+        return Ok(ExportResult {
+            kind: opts.kind,
+            format: opts.format,
+            glb: Vec::new(),
+            decomposed: Some(decomposed),
+            geometry_path,
+            material_path,
+        });
+    }
+
+    let glb_progress = progress.map(|progress| progress.sub(0.60, 0.90));
+    let glb = crate::gltf::write_glb_with_progress(
         crate::gltf::GlbInput {
             root_mesh: Some(root_mesh),
             root_materials: root_mtl,
@@ -443,11 +926,13 @@ pub fn assemble_glb_with_loadout(
         },
         &crate::gltf::GlbOptions {
             material_mode: opts.material_mode,
+            preserve_textureless_decal_primitives: false,
             metadata: crate::gltf::GlbMetadata {
                 entity_name: Some(resolved.entity_name.clone()),
                 geometry_path: Some(geometry_path.clone()),
                 material_path: Some(material_path.clone()),
                 export_options: crate::gltf::ExportOptionsMetadata {
+                    kind: format!("{:?}", opts.kind),
                     material_mode: format!("{:?}", opts.material_mode),
                     format: format!("{:?}", opts.format),
                     lod_level: opts.lod_level,
@@ -458,10 +943,16 @@ pub fn assemble_glb_with_loadout(
             },
             fallback_palette: root_palette,
         },
+        glb_progress.as_ref(),
     )?;
 
+    report_progress(progress, 0.90, "Writing bundled file");
+
     Ok(ExportResult {
+        kind: opts.kind,
+        format: opts.format,
         glb,
+        decomposed: None,
         geometry_path,
         material_path,
     })
@@ -474,7 +965,16 @@ fn load_child_mesh(
     db: &Database,
     p4k: &MappedP4k,
     opts: &ExportOptions,
-) -> Option<(crate::types::Mesh, Option<mtl::MtlFile>, Option<nmc::NodeMeshCombo>, Option<mtl::TintPalette>, Vec<crate::skeleton::Bone>)> {
+) -> Option<(
+    crate::types::Mesh,
+    Option<mtl::MtlFile>,
+    Option<nmc::NodeMeshCombo>,
+    Option<mtl::TintPalette>,
+    Vec<crate::skeleton::Bone>,
+    String,
+    String,
+    Option<String>,
+)> {
     let result = if child.geometry_path.is_some() {
         let gp = child.geometry_path.as_deref().unwrap_or("");
         let mp = child.material_path.as_deref().unwrap_or("");
@@ -488,7 +988,289 @@ fn load_child_mesh(
         export_entity_payload(db, p4k, &child.record, opts)
     };
 
-    result.ok().map(|(mesh, mtl, _tex, nmc, palette, _, _, bones)| (mesh, mtl, nmc, palette, bones))
+    result
+        .ok()
+        .map(|(mesh, mtl, _tex, nmc, palette, geometry_path, material_path, bones, skeleton_source_path)| {
+        (mesh, mtl, nmc, palette, bones, geometry_path, material_path, skeleton_source_path)
+    })
+}
+
+struct ChildPayloadSpec {
+    child: crate::types::ResolvedNode,
+    parent_entity_name: String,
+    parent_node_name: String,
+    no_rotation: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ChildPayloadCacheKey {
+    record_id: starbreaker_datacore::types::CigGuid,
+    geometry_path: Option<String>,
+    material_path: Option<String>,
+}
+
+#[derive(Clone)]
+struct LoadedChildPayload {
+    mesh: crate::types::Mesh,
+    materials: Option<mtl::MtlFile>,
+    textures: Option<MaterialTextures>,
+    nmc: Option<nmc::NodeMeshCombo>,
+    palette: Option<mtl::TintPalette>,
+    bones: Vec<crate::skeleton::Bone>,
+    geometry_path: String,
+    material_path: String,
+    skeleton_source_path: Option<String>,
+}
+
+fn collect_child_payload_specs(
+    children: &[crate::types::ResolvedNode],
+    parent_entity_name: &str,
+    override_attachment: Option<(&str, bool)>,
+    out: &mut Vec<ChildPayloadSpec>,
+) {
+    for child in children {
+        let (attach_name, no_rotation) = match override_attachment {
+            Some((name, parent_no_rot)) => (name.to_string(), child.no_rotation || parent_no_rot),
+            None => (child.attachment_name.clone(), child.no_rotation),
+        };
+
+        let child_creates_nodes = child.has_geometry || child.nmc.is_some();
+        if child_creates_nodes {
+            out.push(ChildPayloadSpec {
+                child: child.clone_payload_source(),
+                parent_entity_name: parent_entity_name.to_string(),
+                parent_node_name: attach_name,
+                no_rotation,
+            });
+            collect_child_payload_specs(&child.children, &child.entity_name, None, out);
+        } else {
+            collect_child_payload_specs(
+                &child.children,
+                parent_entity_name,
+                Some((&child.attachment_name, child.no_rotation)),
+                out,
+            );
+        }
+    }
+}
+
+fn empty_child_mesh() -> crate::types::Mesh {
+    crate::types::Mesh {
+        positions: Vec::new(),
+        indices: Vec::new(),
+        uvs: None,
+        secondary_uvs: None,
+        normals: None,
+        tangents: None,
+        colors: None,
+        submeshes: Vec::new(),
+        model_min: [0.0; 3],
+        model_max: [0.0; 3],
+        scaling_min: [0.0; 3],
+        scaling_max: [0.0; 3],
+    }
+}
+
+fn normalize_decomposed_source_path(p4k: &MappedP4k, path: &str) -> String {
+    let p4k_path = datacore_path_to_p4k(path);
+    p4k.entry_case_insensitive(&p4k_path)
+        .map(|entry| entry.name.replace('\\', "/"))
+        .unwrap_or_else(|| p4k_path.replace('\\', "/"))
+}
+
+fn replace_extension(path: &str, new_extension: &str) -> String {
+    let Some((stem, _)) = path.rsplit_once('.') else {
+        return format!("{path}{new_extension}");
+    };
+    stem.to_string() + new_extension
+}
+
+fn decomposed_mesh_asset_path(p4k: &MappedP4k, geometry_path: &str) -> Option<String> {
+    if geometry_path.is_empty() {
+        None
+    } else {
+        Some(replace_extension(&normalize_decomposed_source_path(p4k, geometry_path), ".glb"))
+    }
+}
+
+fn build_child_payload_cache_key(child: &crate::types::ResolvedNode) -> ChildPayloadCacheKey {
+    ChildPayloadCacheKey {
+        record_id: child.record.id,
+        geometry_path: child.geometry_path.clone(),
+        material_path: child.material_path.clone(),
+    }
+}
+
+fn load_child_payload_asset(
+    child: &crate::types::ResolvedNode,
+    db: &Database,
+    p4k: &MappedP4k,
+    mesh_opts: &ExportOptions,
+    final_material_mode: MaterialMode,
+    existing_asset_paths: Option<&HashSet<String>>,
+) -> Option<LoadedChildPayload> {
+    if mesh_opts.kind == ExportKind::Decomposed {
+        if let Some(geometry_path) = child.geometry_path.as_deref() {
+            if let Some(mesh_asset_path) = decomposed_mesh_asset_path(p4k, geometry_path) {
+                if existing_asset_paths
+                    .is_some_and(|paths| paths.contains(&mesh_asset_path.to_ascii_lowercase()))
+                {
+                    let material_path = child.material_path.as_deref().unwrap_or("");
+                    let (_, materials) = load_nmc_and_material(p4k, geometry_path, material_path);
+                    let skeleton_source_path = resolve_geometry_files(p4k, geometry_path)
+                        .ok()
+                        .and_then(|resolved| {
+                            skeleton_source_paths(resolved.skeleton_path.as_deref(), &resolved.parts[0].path)
+                                .first()
+                                .map(|path| (*path).to_string())
+                        });
+                    return Some(LoadedChildPayload {
+                        mesh: empty_child_mesh(),
+                        materials,
+                        textures: None,
+                        nmc: None,
+                        palette: None,
+                        bones: Vec::new(),
+                        geometry_path: geometry_path.to_string(),
+                        material_path: material_path.to_string(),
+                        skeleton_source_path,
+                    });
+                }
+            }
+        }
+    }
+
+    let (mesh, mtl, nmc, palette, bones, geometry_path, material_path, skeleton_source_path) =
+        load_child_mesh(child, db, p4k, mesh_opts)?;
+    let textures = if final_material_mode.include_textures() {
+        mtl.as_ref().map(|materials| {
+            let mut png_cache = PngCache::new();
+            load_material_textures(
+                p4k,
+                materials,
+                palette.as_ref(),
+                mesh_opts.texture_mip,
+                &mut png_cache,
+                final_material_mode.include_normals(),
+                final_material_mode.experimental(),
+            )
+        })
+    } else {
+        None
+    };
+
+    Some(LoadedChildPayload {
+        mesh,
+        materials: mtl,
+        textures,
+        nmc,
+        palette,
+        bones,
+        geometry_path,
+        material_path,
+        skeleton_source_path,
+    })
+}
+
+fn load_child_payloads(
+    specs: Vec<ChildPayloadSpec>,
+    db: &Database,
+    p4k: &MappedP4k,
+    mesh_opts: &ExportOptions,
+    final_material_mode: MaterialMode,
+    existing_asset_paths: Option<&HashSet<String>>,
+) -> Vec<crate::types::EntityPayload> {
+    use rayon::prelude::*;
+
+    let mut unique_children = Vec::new();
+    let mut unique_child_indices = std::collections::HashMap::new();
+    let mut spec_asset_indices = Vec::with_capacity(specs.len());
+
+    for spec in &specs {
+        let child = &spec.child;
+        if !child.has_geometry {
+            spec_asset_indices.push(None);
+            continue;
+        }
+
+        let cache_key = build_child_payload_cache_key(child);
+        let unique_index = if let Some(&index) = unique_child_indices.get(&cache_key) {
+            index
+        } else {
+            let index = unique_children.len();
+            unique_children.push(child.clone_payload_source());
+            unique_child_indices.insert(cache_key, index);
+            index
+        };
+        spec_asset_indices.push(Some(unique_index));
+    }
+
+    let loaded_assets: Vec<Option<LoadedChildPayload>> = unique_children
+        .into_par_iter()
+        .map(|child| {
+            load_child_payload_asset(
+                &child,
+                db,
+                p4k,
+                mesh_opts,
+                final_material_mode,
+                existing_asset_paths,
+            )
+        })
+        .collect();
+
+    specs
+        .into_iter()
+        .enumerate()
+        .filter_map(|(spec_index, spec)| {
+            let child = &spec.child;
+            if child.has_geometry {
+                let asset_index = spec_asset_indices[spec_index]?;
+                let loaded = loaded_assets.get(asset_index)?.as_ref()?;
+                Some(crate::types::EntityPayload {
+                    mesh: loaded.mesh.clone(),
+                    materials: loaded.materials.clone(),
+                    textures: loaded.textures.clone(),
+                    nmc: loaded.nmc.clone(),
+                    palette: loaded.palette.clone(),
+                    geometry_path: loaded.geometry_path.clone(),
+                    material_path: loaded.material_path.clone(),
+                    bones: loaded.bones.clone(),
+                    skeleton_source_path: loaded.skeleton_source_path.clone(),
+                    entity_name: child.entity_name.clone(),
+                    parent_node_name: spec.parent_node_name.clone(),
+                    parent_entity_name: spec.parent_entity_name.clone(),
+                    no_rotation: spec.no_rotation,
+                    offset_position: child.offset_position,
+                    offset_rotation: child.offset_rotation,
+                    detach_direction: child.detach_direction,
+                    port_flags: child.port_flags.clone(),
+                })
+            } else if child.nmc.is_some() {
+                Some(crate::types::EntityPayload {
+                    mesh: empty_child_mesh(),
+                    materials: None,
+                    textures: None,
+                    nmc: child.nmc.clone(),
+                    palette: None,
+                    geometry_path: child.geometry_path.clone().unwrap_or_default(),
+                    material_path: child.material_path.clone().unwrap_or_default(),
+                    bones: Vec::new(),
+                    skeleton_source_path: None,
+                    entity_name: child.entity_name.clone(),
+                    parent_node_name: spec.parent_node_name.clone(),
+                    parent_entity_name: spec.parent_entity_name.clone(),
+                    no_rotation: spec.no_rotation,
+                    offset_position: child.offset_position,
+                    offset_rotation: child.offset_rotation,
+                    detach_direction: child.detach_direction,
+                    port_flags: child.port_flags.clone(),
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// Flatten a resolved tree into EntityPayload list, loading meshes on demand.
@@ -501,94 +1283,21 @@ fn flatten_resolved_tree(
     override_attachment: Option<(&str, bool)>,
     db: &Database,
     p4k: &MappedP4k,
-    opts: &ExportOptions,
+    mesh_opts: &ExportOptions,
+    final_material_mode: MaterialMode,
+    existing_asset_paths: Option<&HashSet<String>>,
     out: &mut Vec<crate::types::EntityPayload>,
 ) {
-    for child in children {
-        let (attach_name, no_rotation) = match override_attachment {
-            Some((name, parent_no_rot)) => (name.to_string(), child.no_rotation || parent_no_rot),
-            None => (child.attachment_name.clone(), child.no_rotation),
-        };
-
-        let child_creates_nodes = if child.has_geometry {
-            if let Some((mesh, mtl, nmc, palette, bones)) = load_child_mesh(child, db, p4k, opts) {
-                out.push(crate::types::EntityPayload {
-                    mesh,
-                    materials: mtl,
-                    textures: None,
-                    nmc,
-                    palette,
-                    bones,
-                    entity_name: child.entity_name.clone(),
-                    parent_node_name: attach_name,
-                    parent_entity_name: parent_entity_name.to_string(),
-                    no_rotation,
-                    offset_position: child.offset_position,
-                    offset_rotation: child.offset_rotation,
-                });
-                true
-            } else {
-                false
-            }
-        } else if child.nmc.is_some() {
-            // No mesh geometry but has NMC (helpers/bones) — emit an empty-mesh
-            // payload so NMC nodes enter the scene graph and provide correct
-            // transforms for children (e.g., missile racks with attachment points).
-            let empty_mesh = crate::types::Mesh {
-                positions: Vec::new(),
-                indices: Vec::new(),
-                uvs: None,
-                normals: None,
-                tangents: None,
-                colors: None,
-                submeshes: Vec::new(),
-                model_min: [0.0; 3],
-                model_max: [0.0; 3],
-                scaling_min: [0.0; 3],
-                scaling_max: [0.0; 3],
-            };
-            out.push(crate::types::EntityPayload {
-                mesh: empty_mesh,
-                materials: None,
-                textures: None,
-                nmc: child.nmc.clone(),
-                palette: None,
-                bones: Vec::new(),
-                entity_name: child.entity_name.clone(),
-                parent_node_name: attach_name,
-                parent_entity_name: parent_entity_name.to_string(),
-                no_rotation,
-                offset_position: child.offset_position,
-                offset_rotation: child.offset_rotation,
-            });
-            true
-        } else {
-            false
-        };
-
-        if child_creates_nodes {
-            flatten_resolved_tree(
-                &child.children,
-                &child.entity_name,
-                None,
-                db,
-                p4k,
-                opts,
-                out,
-            );
-        } else {
-            // No geometry — reparent grandchildren to this child's attachment point.
-            flatten_resolved_tree(
-                &child.children,
-                parent_entity_name,
-                Some((&child.attachment_name, child.no_rotation)),
-                db,
-                p4k,
-                opts,
-                out,
-            );
-        }
-    }
+    let mut specs = Vec::new();
+    collect_child_payload_specs(children, parent_entity_name, override_attachment, &mut specs);
+    out.extend(load_child_payloads(
+        specs,
+        db,
+        p4k,
+        mesh_opts,
+        final_material_mode,
+        existing_asset_paths,
+    ));
 }
 
 // ── Shared loadout resolution ────────────────────────────────────────────────
@@ -628,7 +1337,7 @@ pub fn resolve_loadout_meshes(
     let (nmc, _mtl) = load_nmc_and_material(p4k, &geometry_path, &material_path);
 
     let resolved = resolve_geometry_files(p4k, &geometry_path)?;
-    let bones = load_skeleton(p4k, resolved.skeleton_path.as_deref());
+    let bones = load_skeleton(p4k, resolved.skeleton_path.as_deref(), &resolved.parts[0].path);
 
     // Check if mesh companion exists.
     // CDF files don't have companion files — check for the CDF itself.
@@ -700,6 +1409,8 @@ pub fn resolve_loadout_meshes(
                         no_rotation: false,
                         offset_position: [0.0; 3],
                         offset_rotation: [0.0; 3],
+                        detach_direction: [0.0; 3],
+                        port_flags: String::new(),
                         nmc: None,
                         bones: Vec::new(),
                         has_geometry: wheel_has_geom,
@@ -721,6 +1432,8 @@ pub fn resolve_loadout_meshes(
                 no_rotation: false,
                 offset_position: [0.0; 3],
                 offset_rotation: [0.0; 3],
+                detach_direction: [0.0; 3],
+                port_flags: String::new(),
                 nmc: None,
                 bones: Vec::new(),
                 has_geometry: part_has_geom,
@@ -742,6 +1455,8 @@ pub fn resolve_loadout_meshes(
         no_rotation: false,
         offset_position: [0.0; 3],
         offset_rotation: [0.0; 3],
+        detach_direction: [0.0; 3],
+        port_flags: String::new(),
         nmc,
         bones,
         has_geometry,
@@ -769,6 +1484,37 @@ fn resolve_children(
                 .clone()
                 .unwrap_or_else(|| node.item_port_name.clone());
 
+            if !opts.include_shields
+                && is_shield_related_name(&node.entity_name)
+                    || !opts.include_shields
+                        && is_shield_related_name(&attachment_name)
+                    || !opts.include_shields
+                        && path_is_shield_related(node.geometry_path.as_deref())
+                    || !opts.include_shields
+                        && path_is_shield_related(node.material_path.as_deref())
+            {
+                log::info!(
+                    "  {} -> shield export disabled, skipping geometry and children",
+                    node.entity_name
+                );
+                return crate::types::ResolvedNode {
+                    entity_name: node.entity_name.clone(),
+                    attachment_name,
+                    no_rotation: node.no_rotation,
+                    offset_position: node.offset_position,
+                    offset_rotation: node.offset_rotation,
+                    detach_direction: node.detach_direction,
+                    port_flags: node.port_flags.clone(),
+                    nmc: None,
+                    bones: Vec::new(),
+                    has_geometry: false,
+                    record: node.record,
+                    geometry_path: None,
+                    material_path: node.material_path.clone(),
+                    children: Vec::new(),
+                };
+            }
+
             // Skip geometry (and entire subtree) for ports marked invisible in the vehicle XML.
             let port_invisible = invisible_ports.contains(&node.item_port_name);
 
@@ -780,6 +1526,8 @@ fn resolve_children(
                     no_rotation: node.no_rotation,
                     offset_position: node.offset_position,
                     offset_rotation: node.offset_rotation,
+                    detach_direction: node.detach_direction,
+                    port_flags: node.port_flags.clone(),
                     nmc: None,
                     bones: Vec::new(),
                     has_geometry: false,
@@ -799,6 +1547,8 @@ fn resolve_children(
                     no_rotation: node.no_rotation,
                     offset_position: node.offset_position,
                     offset_rotation: node.offset_rotation,
+                    detach_direction: node.detach_direction,
+                    port_flags: node.port_flags.clone(),
                     nmc: None,
                     bones: Vec::new(),
                     has_geometry: false,
@@ -842,6 +1592,8 @@ fn resolve_children(
                 no_rotation: node.no_rotation,
                 offset_position: node.offset_position,
                 offset_rotation: node.offset_rotation,
+                detach_direction: node.detach_direction,
+                port_flags: node.port_flags.clone(),
                 nmc,
                 bones: Vec::new(),
                 has_geometry,
@@ -852,6 +1604,25 @@ fn resolve_children(
             }
         })
         .collect()
+}
+
+fn is_shield_related_name(value: &str) -> bool {
+    value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|segment| !segment.is_empty())
+        .any(|segment| {
+            let lowered = segment.to_ascii_lowercase();
+            lowered == "shield"
+                || lowered == "shld"
+                || lowered == "sheild"
+                || lowered.starts_with("shield")
+                || lowered.starts_with("sheild")
+        })
+}
+
+fn path_is_shield_related(path: Option<&str>) -> bool {
+    path.is_some_and(|value| value.to_ascii_lowercase().contains("/shields/"))
+        || path.is_some_and(|value| value.to_ascii_lowercase().contains("\\shields\\"))
 }
 
 // ── Interior loading ────────────────────────────────────────────────────────
@@ -886,8 +1657,12 @@ pub struct InteriorContainerData {
     pub name: String,
     /// 4×4 column-major transform positioning this container relative to the hull.
     pub container_transform: [[f32; 4]; 4],
-    /// Each entry: (index into unique_cgfs, per-object local transform).
-    pub placements: Vec<(usize, [[f32; 4]; 4])>,
+    /// Each entry: (index into unique_cgfs, per-object local transform,
+    /// optional per-placement tint palette override that takes precedence over
+    /// the container's palette). Loadout-attached children resolve their own
+    /// palette from the child entity's SGeometryResourceParams so each gadget
+    /// tints independently of the parent socpak's tint palette.
+    pub placements: Vec<(usize, [[f32; 4]; 4], Option<mtl::TintPalette>)>,
     pub lights: Vec<crate::types::LightInfo>,
     /// Tint palette resolved from the socpak's IncludedObjects tint_palette_paths.
     pub palette: Option<mtl::TintPalette>,
@@ -920,17 +1695,20 @@ fn load_interiors(
         }
     }
 
-    build_interiors_from_payloads(db, &payloads, opts.include_lights)
+    build_interiors_from_payloads(db, p4k, &payloads, opts.include_lights)
 }
 
 /// Shared interior building: dedup CGFs, resolve GUIDs, collect placements and lights.
 /// Used by both `load_interiors` (from DataCore) and `socpaks_to_glb` (from explicit paths).
 fn build_interiors_from_payloads(
     db: &Database,
+    p4k: &MappedP4k,
     payloads: &[crate::types::InteriorPayload],
     include_lights: bool,
 ) -> LoadedInteriors {
     use std::collections::HashMap;
+    use starbreaker_common::CigGuid;
+    use std::str::FromStr;
 
     let guid_geom_compiled = db.compile_rooted::<String>(
         "EntityClassDefinition.Components[SGeometryResourceParams].Geometry.Geometry.Geometry.path",
@@ -942,6 +1720,12 @@ fn build_interiors_from_payloads(
     let mut cgf_cache: HashMap<String, Option<usize>> = HashMap::new();
     let mut unique_cgfs = Vec::new();
     let mut container_data = Vec::new();
+    // Cache of parent CGF NMC node tables for helper-bone resolution during
+    // loadout expansion. Keyed by lowercase CGF path. Value of None means we
+    // tried to load it and failed.
+    let mut nmc_cache: HashMap<String, Option<crate::nmc::NodeMeshCombo>> = HashMap::new();
+    // Built lazily — only entities that resolve via GUID trigger loadout walks.
+    let mut entity_index: Option<starbreaker_datacore::loadout::EntityIndex> = None;
 
     for payload in payloads {
         log::debug!(
@@ -991,7 +1775,39 @@ fn build_interiors_from_payloads(
             });
 
             if let Some(idx) = mesh_idx {
-                placements.push((idx, im.transform));
+                placements.push((idx, im.transform, None));
+
+                // Expand entity loadout attachments. Many interior entities
+                // (e.g. fire-extinguisher cabinets, kit lockers) carry their
+                // visible body in a child loadout entry attached at a named
+                // CryNode helper bone on the parent CGF, rather than on their
+                // own SGeometryResourceParams.
+                if let Some(guid_str) = &im.entity_class_guid {
+                    if let Ok(guid) = CigGuid::from_str(guid_str) {
+                        if let Some(parent_record) = db.record_by_id(&guid) {
+                            let idx_ref = entity_index.get_or_insert_with(|| {
+                                starbreaker_datacore::loadout::EntityIndex::new(db)
+                            });
+                            let tree = starbreaker_datacore::loadout::resolve_loadout_indexed(
+                                idx_ref,
+                                parent_record,
+                            );
+                            if !tree.root.children.is_empty() {
+                                expand_loadout_into_placements(
+                                    db,
+                                    p4k,
+                                    &tree.root.children,
+                                    mat4_from_array(&im.transform),
+                                    &cgf_path,
+                                    &mut nmc_cache,
+                                    &mut cgf_cache,
+                                    &mut unique_cgfs,
+                                    &mut placements,
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -1004,7 +1820,11 @@ fn build_interiors_from_payloads(
             let record = db.records_of_type(tpt_si).find(|r| {
                 db.resolve_string2(r.name_offset).to_lowercase().ends_with(&short_name)
             })?;
-            query_tint_from_record(db, record)
+            query_tint_from_record(
+                db,
+                record,
+                Some(short_name),
+            )
         });
 
         if let Some(ref p) = palette {
@@ -1138,6 +1958,282 @@ fn compute_nmc_world_transforms(nmc: &crate::nmc::NodeMeshCombo) -> Vec<glam::Ma
     world.into_iter().flatten().collect()
 }
 
+/// Convert a column-major 4x4 array into a glam::Mat4.
+fn mat4_from_array(m: &[[f32; 4]; 4]) -> glam::Mat4 {
+    glam::Mat4::from_cols_array_2d(m)
+}
+
+/// Convert a glam::Mat4 back to the column-major array form used in placements.
+fn mat4_to_array(m: glam::Mat4) -> [[f32; 4]; 4] {
+    m.to_cols_array_2d()
+}
+
+fn mat3x4_from_mat4(m: glam::Mat4) -> [[f32; 4]; 3] {
+    let cols = m.to_cols_array_2d();
+    [
+        [cols[0][0], cols[1][0], cols[2][0], cols[3][0]],
+        [cols[0][1], cols[1][1], cols[2][1], cols[3][1]],
+        [cols[0][2], cols[1][2], cols[2][2], cols[3][2]],
+    ]
+}
+
+fn bone_world_transform(bone: &crate::skeleton::Bone) -> glam::Mat4 {
+    let rotation = glam::Quat::from_xyzw(
+        bone.world_rotation[1],
+        bone.world_rotation[2],
+        bone.world_rotation[3],
+        bone.world_rotation[0],
+    );
+    glam::Mat4::from_rotation_translation(rotation, glam::Vec3::from(bone.world_position))
+}
+
+fn synthesize_nmc_from_bones(
+    mesh: &crate::types::Mesh,
+    bones: &[crate::skeleton::Bone],
+) -> Option<crate::nmc::NodeMeshCombo> {
+    if bones.is_empty() || mesh.submeshes.is_empty() {
+        return None;
+    }
+
+    let mut referenced_node_indices = std::collections::BTreeSet::new();
+    for submesh in &mesh.submeshes {
+        let index = submesh.node_parent_index as usize;
+        if index >= bones.len() {
+            return None;
+        }
+        referenced_node_indices.insert(index);
+    }
+
+    if referenced_node_indices.len() <= 1 {
+        return None;
+    }
+
+    let world_transforms = bones.iter().map(bone_world_transform).collect::<Vec<_>>();
+    let root_index = bones
+        .iter()
+        .enumerate()
+        .find(|(index, bone)| bone.parent_index.is_none() || bone.parent_index == Some(*index as u16))
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    let root_inv = world_transforms[root_index].inverse();
+    let nodes = bones
+        .iter()
+        .enumerate()
+        .map(|(index, bone)| {
+            let parent_index = bone
+                .parent_index
+                .filter(|parent| (*parent as usize) < bones.len() && *parent as usize != index);
+            let relative = if let Some(parent) = parent_index {
+                let _ = parent;
+                glam::Mat4::from_rotation_translation(
+                    glam::Quat::from_xyzw(
+                        bone.local_rotation[1],
+                        bone.local_rotation[2],
+                        bone.local_rotation[3],
+                        bone.local_rotation[0],
+                    ),
+                    glam::Vec3::from_array(bone.local_position),
+                )
+            } else {
+                root_inv * world_transforms[index]
+            };
+            crate::nmc::NmcNode {
+                name: bone.name.clone(),
+                parent_index,
+                world_to_bone: mat3x4_from_mat4(relative.inverse()),
+                bone_to_world: mat3x4_from_mat4(relative),
+                scale: [1.0, 1.0, 1.0],
+                geometry_type: 0,
+                properties: std::collections::HashMap::new(),
+            }
+        })
+        .collect();
+
+    Some(crate::nmc::NodeMeshCombo {
+        nodes,
+        material_indices: vec![0; bones.len()],
+    })
+}
+
+/// Load NMC node table for a CGF/CGA file. The metadata is bundled with the
+/// .cgf itself in Ivo-format files; for split files (.cgf + .cgfm) the table
+/// lives in the .cgfm sidecar.
+fn load_nmc_for_cgf(p4k: &MappedP4k, cgf_path: &str) -> Option<crate::nmc::NodeMeshCombo> {
+    let try_path = |path: &str| -> Option<crate::nmc::NodeMeshCombo> {
+        let p4k_path = datacore_path_to_p4k(path);
+        let bytes = p4k.entry_case_insensitive(&p4k_path).and_then(|e| p4k.read(e).ok())?;
+        let (nodes, material_indices) = crate::nmc::parse_nmc_full(&bytes)?;
+        Some(crate::nmc::NodeMeshCombo { nodes, material_indices })
+    };
+    if let Some(nmc) = try_path(cgf_path) {
+        return Some(nmc);
+    }
+    let lower = cgf_path.to_lowercase();
+    if lower.ends_with(".cgf") || lower.ends_with(".cga") {
+        let sidecar = format!("{cgf_path}m");
+        if let Some(nmc) = try_path(&sidecar) {
+            return Some(nmc);
+        }
+    }
+    None
+}
+
+/// Compose a child-attachment transform from a parent's NMC + named helper bone
+/// + per-port `Offset` (Position + Euler-degree Rotation, CryEngine X,Y,Z order).
+///
+/// Returns identity if the parent NMC is unavailable, or if the helper bone
+/// cannot be located. Callers should still emit the placement so the geometry
+/// is not silently dropped.
+fn compose_helper_transform(
+    parent_nmc: Option<&crate::nmc::NodeMeshCombo>,
+    helper_name: Option<&str>,
+    offset_pos: [f32; 3],
+    offset_rot_deg: [f32; 3],
+) -> glam::Mat4 {
+    let helper_local = if let (Some(nmc), Some(name)) = (parent_nmc, helper_name) {
+        let world = compute_nmc_world_transforms(nmc);
+        let lower_name = name.to_ascii_lowercase();
+        match nmc
+            .nodes
+            .iter()
+            .position(|n| n.name.eq_ignore_ascii_case(&lower_name))
+        {
+            Some(i) if i < world.len() => world[i],
+            _ => {
+                log::debug!(
+                    "  loadout helper bone '{name}' not found in parent NMC ({} nodes)",
+                    nmc.nodes.len()
+                );
+                glam::Mat4::IDENTITY
+            }
+        }
+    } else {
+        glam::Mat4::IDENTITY
+    };
+
+    let offset = if offset_pos == [0.0; 3] && offset_rot_deg == [0.0; 3] {
+        glam::Mat4::IDENTITY
+    } else {
+        let r = glam::Mat4::from_euler(
+            glam::EulerRot::XYZ,
+            offset_rot_deg[0].to_radians(),
+            offset_rot_deg[1].to_radians(),
+            offset_rot_deg[2].to_radians(),
+        );
+        let t = glam::Mat4::from_translation(glam::Vec3::from(offset_pos));
+        t * r
+    };
+
+    helper_local * offset
+}
+
+/// Walk a loadout subtree, emitting additional `(cgf_idx, transform)` placements
+/// for each child entity that has a resolvable geometry path.
+///
+/// The transform for each child is composed as
+/// `parent_world × helper_local_on_parent_cgf × port_offset`.
+/// If the parent NMC is missing or the helper bone is not found, the child is
+/// still placed using the parent's world transform plus any port offset, so
+/// missing geometry is never silently dropped.
+fn expand_loadout_into_placements(
+    db: &Database,
+    p4k: &MappedP4k,
+    children: &[starbreaker_datacore::loadout::LoadoutNode],
+    parent_world: glam::Mat4,
+    parent_cgf_path: &str,
+    nmc_cache: &mut std::collections::HashMap<String, Option<crate::nmc::NodeMeshCombo>>,
+    cgf_cache: &mut std::collections::HashMap<String, Option<usize>>,
+    unique_cgfs: &mut Vec<InteriorCgfEntry>,
+    placements: &mut Vec<(usize, [[f32; 4]; 4], Option<mtl::TintPalette>)>,
+) {
+    if children.is_empty() {
+        return;
+    }
+    // Look up parent NMC once for all children at this level.
+    let parent_key = parent_cgf_path.to_ascii_lowercase();
+    if !nmc_cache.contains_key(&parent_key) {
+        let nmc = load_nmc_for_cgf(p4k, parent_cgf_path);
+        nmc_cache.insert(parent_key.clone(), nmc);
+    }
+    // Clone the NMC out of the cache so we can release the borrow before
+    // recursing (children resolve a different parent NMC).
+    let parent_nmc: Option<crate::nmc::NodeMeshCombo> =
+        nmc_cache.get(&parent_key).and_then(|v| v.clone());
+
+    for child in children {
+        let Some(child_geom) = child.geometry_path.as_deref() else {
+            // No geometry on this node — but its grandchildren may still have
+            // some (e.g. an empty container item that holds tools). Recurse
+            // using the parent's transform and CGF as the attachment frame.
+            if !child.children.is_empty() {
+                expand_loadout_into_placements(
+                    db,
+                    p4k,
+                    &child.children,
+                    parent_world,
+                    parent_cgf_path,
+                    nmc_cache,
+                    cgf_cache,
+                    unique_cgfs,
+                    placements,
+                );
+            }
+            continue;
+        };
+
+        let helper_xform = compose_helper_transform(
+            parent_nmc.as_ref(),
+            child.helper_bone_name.as_deref(),
+            child.offset_position,
+            child.offset_rotation,
+        );
+        let child_world = parent_world * helper_xform;
+
+        // Each loadout child resolves its own tint palette from the child
+        // entity's SGeometryResourceParams (falling back to a name-matched
+        // TintPaletteTree record). Gadgets like fire-extinguisher cabinets
+        // need their own red/black palette regardless of the parent socpak's
+        // palette.
+        let child_palette = query_tint_palette(db, &child.record);
+
+        let geom_owned = child_geom.to_string();
+        let mtl_owned = child.material_path.clone();
+        let child_idx = *cgf_cache.entry(geom_owned.clone()).or_insert_with(|| {
+            let idx = unique_cgfs.len();
+            let name = geom_owned
+                .rsplit('/')
+                .next()
+                .unwrap_or(&geom_owned)
+                .rsplit_once('.')
+                .map(|(stem, _)| stem.to_string())
+                .unwrap_or_else(|| geom_owned.clone());
+            unique_cgfs.push(InteriorCgfEntry {
+                cgf_path: geom_owned.clone(),
+                material_path: mtl_owned.clone(),
+                name,
+            });
+            Some(idx)
+        });
+        if let Some(idx) = child_idx {
+            placements.push((idx, mat4_to_array(child_world), child_palette));
+        }
+
+        if !child.children.is_empty() {
+            expand_loadout_into_placements(
+                db,
+                p4k,
+                &child.children,
+                child_world,
+                &geom_owned,
+                nmc_cache,
+                cgf_cache,
+                unique_cgfs,
+                placements,
+            );
+        }
+    }
+}
+
 /// Bake NMC node transforms into mesh vertex positions.
 ///
 /// When `use_root_inv` is true, transforms are made root-relative by factoring
@@ -1224,6 +2320,176 @@ fn export_cgf_from_path(
     export_entity_from_paths_cached(p4k, geometry_path, mtl_path, opts, png_cache, use_model_bbox)
 }
 
+fn load_interior_mesh_asset(
+    p4k: &MappedP4k,
+    entry: &InteriorCgfEntry,
+    opts: &ExportOptions,
+    png_cache: &mut PngCache,
+) -> Option<InteriorMeshAsset> {
+    match export_cgf_from_path(
+        p4k,
+        &entry.cgf_path,
+        entry.material_path.as_deref(),
+        opts,
+        png_cache,
+        false,
+    ) {
+        Ok((mesh, mtl, _tex, nmc, _palette, _, _, _bones, _skeleton_source_path)) => {
+            let needs_bake = mesh
+                .scaling_min
+                .iter()
+                .zip(&mesh.model_min)
+                .chain(mesh.scaling_max.iter().zip(&mesh.model_max))
+                .any(|(s, m)| (s - m).abs() > 0.01);
+            let mesh = if needs_bake {
+                bake_nmc_into_mesh(mesh, nmc.as_ref(), false)
+            } else {
+                mesh
+            };
+            Some((mesh, mtl, nmc))
+        }
+        Err(e) => {
+            log::warn!("failed to load CGF {}: {e}", entry.cgf_path);
+            None
+        }
+    }
+}
+
+fn preload_interior_meshes(
+    interiors: &LoadedInteriors,
+    p4k: &MappedP4k,
+    opts: &ExportOptions,
+) -> Vec<Option<InteriorMeshAsset>> {
+    use rayon::prelude::*;
+
+    interiors
+        .unique_cgfs
+        .par_iter()
+        .map(|entry| {
+            let mut png_cache = PngCache::new();
+            load_interior_mesh_asset(p4k, entry, opts, &mut png_cache)
+        })
+        .collect()
+}
+
+pub(crate) fn tint_palette_hash(palette: Option<&mtl::TintPalette>) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let Some(palette) = palette else {
+        return 0;
+    };
+
+    let mut hasher = std::hash::DefaultHasher::new();
+    for color in [palette.primary, palette.secondary, palette.tertiary, palette.glass] {
+        color[0].to_bits().hash(&mut hasher);
+        color[1].to_bits().hash(&mut hasher);
+        color[2].to_bits().hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn collect_interior_palettes(
+    interiors: &LoadedInteriors,
+    fallback_palette: Option<&mtl::TintPalette>,
+) -> Vec<(u64, Option<mtl::TintPalette>)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut palettes = Vec::new();
+
+    for container in &interiors.containers {
+        let palette = container.palette.as_ref().or(fallback_palette).cloned();
+        let palette_hash = tint_palette_hash(palette.as_ref());
+        if seen.insert(palette_hash) {
+            palettes.push((palette_hash, palette));
+        }
+
+        // Per-placement palette overrides (e.g. loadout-attached gadgets that
+        // carry their own tint palette via SGeometryResourceParams).
+        for (_, _, placement_palette) in &container.placements {
+            if let Some(pal) = placement_palette {
+                let h = tint_palette_hash(Some(pal));
+                if seen.insert(h) {
+                    palettes.push((h, Some(pal.clone())));
+                }
+            }
+        }
+    }
+
+    palettes
+}
+
+fn preload_interior_textures(
+    interiors: &LoadedInteriors,
+    preloaded_meshes: &[Option<InteriorMeshAsset>],
+    fallback_palette: Option<&mtl::TintPalette>,
+    p4k: &MappedP4k,
+    opts: &ExportOptions,
+) -> std::collections::HashMap<PreloadedTextureKey, MaterialTextures> {
+    use rayon::prelude::*;
+
+    if !opts.material_mode.include_textures() {
+        return std::collections::HashMap::new();
+    }
+
+    let palettes = collect_interior_palettes(interiors, fallback_palette);
+    if palettes.is_empty() {
+        return std::collections::HashMap::new();
+    }
+
+    let mut unique_materials = std::collections::HashMap::<String, mtl::MtlFile>::new();
+    for asset in preloaded_meshes {
+        let Some((_, Some(materials), _)) = asset else {
+            continue;
+        };
+        let Some(source_path) = materials.source_path.as_ref() else {
+            continue;
+        };
+        unique_materials
+            .entry(source_path.to_ascii_lowercase())
+            .or_insert_with(|| materials.clone());
+    }
+
+    if unique_materials.is_empty() {
+        return std::collections::HashMap::new();
+    }
+
+    let jobs: Vec<(String, mtl::MtlFile, u64, Option<mtl::TintPalette>)> = unique_materials
+        .into_iter()
+        .flat_map(|(material_source, materials)| {
+            palettes.iter().map(move |(palette_hash, palette)| {
+                (
+                    material_source.clone(),
+                    materials.clone(),
+                    *palette_hash,
+                    palette.clone(),
+                )
+            })
+        })
+        .collect();
+
+    jobs
+        .into_par_iter()
+        .map(|(material_source, materials, palette_hash, palette)| {
+            let mut png_cache = PngCache::new();
+            let textures = load_material_textures(
+                p4k,
+                &materials,
+                palette.as_ref(),
+                opts.texture_mip,
+                &mut png_cache,
+                opts.material_mode.include_normals(),
+                opts.material_mode.experimental(),
+            );
+            (
+                PreloadedTextureKey {
+                    material_source,
+                    palette_hash,
+                },
+                textures,
+            )
+        })
+        .collect()
+}
+
 struct P4kSiblingReader<'a> {
     p4k: &'a MappedP4k,
     base_path: String,
@@ -1238,122 +2504,925 @@ impl ReadSibling for P4kSiblingReader<'_> {
     }
 }
 
+/// Load a CryEngine split DDS (base + ``.1``, ``.2`` siblings) and reassemble
+/// it into a single standard DDS byte stream, preserving the original block
+/// format (including BC6H / BC7). Does **not** decode pixel data, so it works
+/// for formats the RGBA decoder does not yet support (e.g. gobo HDR masks).
+///
+/// Returns ``None`` if the base entry is missing or parsing fails.
+pub(crate) fn load_raw_dds_file(p4k: &MappedP4k, dds_path: &str) -> Option<Vec<u8>> {
+    let p4k_dds_path = datacore_path_to_p4k(dds_path);
+    let base_entry = p4k.entry_case_insensitive(&p4k_dds_path)?;
+    let base_bytes = p4k.read(base_entry).ok()?;
+    let sibling_reader = P4kSiblingReader {
+        p4k,
+        base_path: p4k_dds_path,
+    };
+    let dds = DdsFile::from_split(&base_bytes, &sibling_reader).ok()?;
+    Some(dds.to_dds())
+}
+
 /// Load all textures (diffuse + normal) for a material file.
 /// Cache for loaded+encoded texture PNGs, keyed by resolved DDS path.
 /// Prevents redundant DDS decode + PNG encode for the same texture file.
 pub(crate) type PngCache = std::collections::HashMap<String, Option<Vec<u8>>>;
 
+fn empty_material_textures(len: usize) -> MaterialTextures {
+    MaterialTextures {
+        diffuse: Vec::with_capacity(len),
+        normal: Vec::with_capacity(len),
+        roughness: Vec::with_capacity(len),
+        emissive: Vec::with_capacity(len),
+        occlusion: Vec::with_capacity(len),
+        diffuse_transform: Vec::with_capacity(len),
+        normal_transform: Vec::with_capacity(len),
+        roughness_transform: Vec::with_capacity(len),
+        emissive_transform: Vec::with_capacity(len),
+        occlusion_transform: Vec::with_capacity(len),
+        bundled_fallbacks: Vec::with_capacity(len),
+    }
+}
+
+fn push_fallback_tag(tags: &mut Vec<String>, tag: &str) {
+    if !tags.iter().any(|existing| existing == tag) {
+        tags.push(tag.to_string());
+    }
+}
+
+fn make_texture_transform(scale: [f32; 2], tex_coord: u32) -> Option<TextureTransformInfo> {
+    if tex_coord == 0
+        && (scale[0] - 1.0).abs() <= 1e-4
+        && (scale[1] - 1.0).abs() <= 1e-4
+    {
+        None
+    } else {
+        Some(TextureTransformInfo { scale, tex_coord })
+    }
+}
+
+fn material_uses_secondary_uv(material: &mtl::SubMaterial) -> bool {
+    material.public_param_f32(&["UseUV2ForStencil"]).is_some_and(|value| value > 0.0)
+        || material.string_gen_mask.contains("SECOND_UVS")
+        || material.string_gen_mask.contains("EMISSIVE_SECOND_UVS")
+}
+
+fn uniform_scale_transform(material: &mtl::SubMaterial, names: &[&str]) -> Option<[f32; 2]> {
+    material
+        .public_param_f32(names)
+        .map(|value| value.abs())
+        .filter(|value| *value > f32::EPSILON)
+        .map(|value| [value, value])
+}
+
+fn simple_texture_transform(
+    material: &mtl::SubMaterial,
+    role: Option<mtl::TextureSemanticRole>,
+) -> Option<TextureTransformInfo> {
+    use mtl::TextureSemanticRole;
+
+    let tex_coord = if material_uses_secondary_uv(material) { 1 } else { 0 };
+    let scale = match role {
+        Some(TextureSemanticRole::ScreenPixelLayout) => {
+            let sx = material
+                .public_param_f32(&["PixelGridTilingX"])
+                .unwrap_or(1.0)
+                .abs();
+            let sy = material
+                .public_param_f32(&["PixelGridTilingY"])
+                .unwrap_or(1.0)
+                .abs();
+            [sx.max(1.0), sy.max(1.0)]
+        }
+        Some(TextureSemanticRole::Breakup) => uniform_scale_transform(
+            material,
+            &["StencilBreakupTiling", "BreakupTiling", "Tiling"],
+        )
+        .or_else(|| material.primary_uv_tiling().map(|value| [value, value]))
+        .unwrap_or([1.0, 1.0]),
+        Some(TextureSemanticRole::BlendMask) => uniform_scale_transform(
+            material,
+            &["BlendMaskTiling", "Tiling", "LayerTiling"],
+        )
+        .or_else(|| material.primary_uv_tiling().map(|value| [value, value]))
+        .unwrap_or([1.0, 1.0]),
+        Some(TextureSemanticRole::ScreenMask)
+        | Some(TextureSemanticRole::WearGloss)
+        | Some(TextureSemanticRole::Dirt)
+        | Some(TextureSemanticRole::PatternMask) => uniform_scale_transform(
+            material,
+            &["GlassTiling", "Tiling", "LayerTiling"],
+        )
+        .or_else(|| material.primary_uv_tiling().map(|value| [value, value]))
+        .unwrap_or([1.0, 1.0]),
+        Some(TextureSemanticRole::WearMask)
+        | Some(TextureSemanticRole::HalControl) => uniform_scale_transform(
+            material,
+            &["Tiling", "LayerTiling"],
+        )
+        .or_else(|| material.primary_uv_tiling().map(|value| [value, value]))
+        .unwrap_or([1.0, 1.0]),
+        _ => uniform_scale_transform(
+            material,
+            &["StencilTiling", "GlassTiling", "Tiling", "LayerTiling", "MacroTiling"],
+        )
+        .or_else(|| material.primary_uv_tiling().map(|value| [value, value]))
+        .unwrap_or([1.0, 1.0]),
+    };
+
+    make_texture_transform(scale, tex_coord)
+}
+
+fn decode_png(bytes: &[u8]) -> Option<image::RgbaImage> {
+    image::load_from_memory_with_format(bytes, image::ImageFormat::Png)
+        .ok()
+        .map(|image| image.to_rgba8())
+}
+
+fn encode_png(image: &image::RgbaImage) -> Option<Vec<u8>> {
+    let mut png_buf = Vec::new();
+    image
+        .write_to(
+            &mut std::io::Cursor::new(&mut png_buf),
+            image::ImageFormat::Png,
+        )
+        .ok()?;
+    Some(png_buf)
+}
+
+fn make_solid_image(width: u32, height: u32, color: [f32; 3], alpha: u8) -> image::RgbaImage {
+    let red = (color[0].clamp(0.0, 1.0) * 255.0).round() as u8;
+    let green = (color[1].clamp(0.0, 1.0) * 255.0).round() as u8;
+    let blue = (color[2].clamp(0.0, 1.0) * 255.0).round() as u8;
+    image::RgbaImage::from_pixel(width.max(1), height.max(1), image::Rgba([red, green, blue, alpha]))
+}
+
+fn sample_pixel(
+    image: &image::RgbaImage,
+    x: u32,
+    y: u32,
+    target_width: u32,
+    target_height: u32,
+) -> image::Rgba<u8> {
+    let src_x = if target_width <= 1 || image.width() <= 1 {
+        0
+    } else {
+        x.saturating_mul(image.width().saturating_sub(1))
+            / target_width.saturating_sub(1)
+    };
+    let src_y = if target_height <= 1 || image.height() <= 1 {
+        0
+    } else {
+        y.saturating_mul(image.height().saturating_sub(1))
+            / target_height.saturating_sub(1)
+    };
+    *image.get_pixel(
+        src_x.min(image.width().saturating_sub(1)),
+        src_y.min(image.height().saturating_sub(1)),
+    )
+}
+
+fn sample_luma(
+    image: &image::RgbaImage,
+    x: u32,
+    y: u32,
+    target_width: u32,
+    target_height: u32,
+) -> f32 {
+    let pixel = sample_pixel(image, x, y, target_width, target_height);
+    (f32::from(pixel[0]) + f32::from(pixel[1]) + f32::from(pixel[2])) / (255.0 * 3.0)
+}
+
+fn tint_image(image: &image::RgbaImage, color: [f32; 3]) -> image::RgbaImage {
+    let mut tinted = image.clone();
+    for pixel in tinted.pixels_mut() {
+        pixel[0] = (f32::from(pixel[0]) * color[0].clamp(0.0, 1.0)).round() as u8;
+        pixel[1] = (f32::from(pixel[1]) * color[1].clamp(0.0, 1.0)).round() as u8;
+        pixel[2] = (f32::from(pixel[2]) * color[2].clamp(0.0, 1.0)).round() as u8;
+    }
+    tinted
+}
+
+fn first_role_path(
+    material: &mtl::SubMaterial,
+    roles: &[mtl::TextureSemanticRole],
+) -> Option<String> {
+    roles
+        .iter()
+        .find_map(|role| material.first_texture_path_for_role(*role))
+}
+
+fn load_texture_png(
+    p4k: &MappedP4k,
+    path: &str,
+    mip: u32,
+    png_cache: &mut PngCache,
+) -> Option<Vec<u8>> {
+    cached_load(p4k, path, mip, png_cache, load_diffuse_texture)
+}
+
+fn load_semantic_texture_png(
+    p4k: &MappedP4k,
+    material: &mtl::SubMaterial,
+    roles: &[mtl::TextureSemanticRole],
+    mip: u32,
+    png_cache: &mut PngCache,
+) -> Option<Vec<u8>> {
+    let path = first_role_path(material, roles)?;
+    load_texture_png(p4k, &path, mip, png_cache)
+}
+
+fn load_layer_diffuse_png(
+    p4k: &MappedP4k,
+    layer: &mtl::MatLayer,
+    mip: u32,
+    png_cache: &mut PngCache,
+) -> Option<Vec<u8>> {
+    if layer.path.is_empty() {
+        return None;
+    }
+
+    let p4k_path = datacore_path_to_p4k(&layer.path);
+    let layer_mtl = try_load_mtl(p4k, &p4k_path)?;
+    let layer_material = mtl::resolve_layer_submaterial(&layer_mtl, &layer.sub_material)?;
+    let texture_path = layer_material.diffuse_tex.as_ref()?;
+    load_texture_png(p4k, texture_path, mip, png_cache)
+}
+
+fn build_layer_source_image(
+    p4k: &MappedP4k,
+    material: &mtl::SubMaterial,
+    layer: &mtl::MatLayer,
+    palette: Option<&mtl::TintPalette>,
+    mip: u32,
+    png_cache: &mut PngCache,
+    canvas_size: Option<(u32, u32)>,
+) -> Option<image::RgbaImage> {
+    let color = material.resolved_layer_color(layer, palette);
+    if let Some(layer_png) = load_layer_diffuse_png(p4k, layer, mip, png_cache) {
+        return decode_png(&layer_png).map(|image| tint_image(&image, color));
+    }
+
+    let (width, height) = canvas_size.unwrap_or((64, 64));
+    Some(make_solid_image(width, height, color, 255))
+}
+
+fn build_layered_base_color_texture(
+    p4k: &MappedP4k,
+    material: &mtl::SubMaterial,
+    palette: Option<&mtl::TintPalette>,
+    mip: u32,
+    png_cache: &mut PngCache,
+) -> Option<Vec<u8>> {
+    let base_layer = material.layers.first()?;
+    let base_image = build_layer_source_image(p4k, material, base_layer, palette, mip, png_cache, None)?;
+    let mut output = base_image.clone();
+
+    if let Some(overlay_layer) = material.layers.get(1) {
+        let overlay_image = build_layer_source_image(
+            p4k,
+            material,
+            overlay_layer,
+            palette,
+            mip,
+            png_cache,
+            Some((output.width(), output.height())),
+        )?;
+        let blend_mask = load_semantic_texture_png(
+            p4k,
+            material,
+            &[
+                mtl::TextureSemanticRole::BlendMask,
+                mtl::TextureSemanticRole::WearMask,
+                mtl::TextureSemanticRole::Breakup,
+                mtl::TextureSemanticRole::Dirt,
+            ],
+            mip,
+            png_cache,
+        )
+        .and_then(|png| decode_png(&png));
+        let blend_factor = material
+            .public_param_f32(&["BlendFactor", "WearBlendBase"])
+            .unwrap_or(0.5)
+            .clamp(0.0, 1.0);
+
+        for y in 0..output.height() {
+            for x in 0..output.width() {
+                let base_pixel = *output.get_pixel(x, y);
+                let overlay_pixel = sample_pixel(&overlay_image, x, y, output.width(), output.height());
+                let mask = blend_mask
+                    .as_ref()
+                    .map(|image| sample_luma(image, x, y, output.width(), output.height()))
+                    .unwrap_or(blend_factor)
+                    .clamp(0.0, 1.0);
+                let inv = 1.0 - mask;
+                output.put_pixel(
+                    x,
+                    y,
+                    image::Rgba([
+                        (f32::from(base_pixel[0]) * inv + f32::from(overlay_pixel[0]) * mask)
+                            .round() as u8,
+                        (f32::from(base_pixel[1]) * inv + f32::from(overlay_pixel[1]) * mask)
+                            .round() as u8,
+                        (f32::from(base_pixel[2]) * inv + f32::from(overlay_pixel[2]) * mask)
+                            .round() as u8,
+                        255,
+                    ]),
+                );
+            }
+        }
+    }
+
+    encode_png(&output)
+}
+
+fn build_illum_blend_texture(
+    p4k: &MappedP4k,
+    material: &mtl::SubMaterial,
+    base_color_png: Option<&Vec<u8>>,
+    mip: u32,
+    png_cache: &mut PngCache,
+) -> Option<Vec<u8>> {
+    let base_image = base_color_png.and_then(|png| decode_png(png))?;
+    let alternate_path = first_role_path(
+        material,
+        &[
+            mtl::TextureSemanticRole::AlternateBaseColor,
+            mtl::TextureSemanticRole::DecalSheet,
+        ],
+    )?;
+    let alternate_png = load_texture_png(p4k, &alternate_path, mip, png_cache)?;
+    let alternate_image = decode_png(&alternate_png)?;
+    let blend_mask = load_semantic_texture_png(
+        p4k,
+        material,
+        &[mtl::TextureSemanticRole::BlendMask],
+        mip,
+        png_cache,
+    )
+    .and_then(|png| decode_png(&png));
+    let blend_factor = material
+        .public_param_f32(&["BlendFactor"])
+        .unwrap_or(0.5)
+        .clamp(0.0, 1.0);
+
+    let mut output = base_image.clone();
+    for y in 0..output.height() {
+        for x in 0..output.width() {
+            let base_pixel = sample_pixel(&base_image, x, y, output.width(), output.height());
+            let alternate_pixel = sample_pixel(&alternate_image, x, y, output.width(), output.height());
+            let mask = blend_mask
+                .as_ref()
+                .map(|image| sample_luma(image, x, y, output.width(), output.height()))
+                .unwrap_or(blend_factor)
+                .clamp(0.0, 1.0);
+            let inv = 1.0 - mask;
+            output.put_pixel(
+                x,
+                y,
+                image::Rgba([
+                    (f32::from(base_pixel[0]) * inv + f32::from(alternate_pixel[0]) * mask)
+                        .round() as u8,
+                    (f32::from(base_pixel[1]) * inv + f32::from(alternate_pixel[1]) * mask)
+                        .round() as u8,
+                    (f32::from(base_pixel[2]) * inv + f32::from(alternate_pixel[2]) * mask)
+                        .round() as u8,
+                    255,
+                ]),
+            );
+        }
+    }
+
+    encode_png(&output)
+}
+
+fn build_stencil_fallback_texture(
+    p4k: &MappedP4k,
+    material: &mtl::SubMaterial,
+    palette: Option<&mtl::TintPalette>,
+    base_color_png: Option<&Vec<u8>>,
+    mip: u32,
+    png_cache: &mut PngCache,
+) -> Option<Vec<u8>> {
+    let decoded = material.decoded_string_gen_mask();
+    if !decoded.has_stencil_map && !material.has_virtual_input("$TintPaletteDecal") {
+        return None;
+    }
+
+    let base_image = base_color_png.and_then(|png| decode_png(png));
+    let stencil_image = load_semantic_texture_png(
+        p4k,
+        material,
+        &[
+            mtl::TextureSemanticRole::Stencil,
+            mtl::TextureSemanticRole::PatternMask,
+        ],
+        mip,
+        png_cache,
+    )
+    .and_then(|png| decode_png(&png));
+    let breakup_image = load_semantic_texture_png(
+        p4k,
+        material,
+        &[
+            mtl::TextureSemanticRole::Breakup,
+            mtl::TextureSemanticRole::Dirt,
+        ],
+        mip,
+        png_cache,
+    )
+    .and_then(|png| decode_png(&png));
+
+    let (width, height) = base_image
+        .as_ref()
+        .map(|image| (image.width(), image.height()))
+        .or_else(|| stencil_image.as_ref().map(|image| (image.width(), image.height())))
+        .or_else(|| breakup_image.as_ref().map(|image| (image.width(), image.height())))
+        .unwrap_or((64, 64));
+
+    let mut output = base_image.unwrap_or_else(|| make_solid_image(width, height, [0.0, 0.0, 0.0], 0));
+    let stencil_color = material
+        .public_param_rgb(&[
+            "StencilDiffuseColor1",
+            "StencilDiffuse1",
+            "StencilTintColor",
+            "TintColor",
+        ])
+        .or_else(|| material.resolved_palette_color(palette))
+        .unwrap_or(material.diffuse);
+    let opacity = material
+        .public_param_f32(&["StencilOpacity", "DecalDiffuseOpacity", "DecalAlphaMult"])
+        .unwrap_or(if material.is_decal() { 0.85 } else { 0.5 })
+        .clamp(0.0, 1.0);
+    let color = [
+        (stencil_color[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+        (stencil_color[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+        (stencil_color[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+    ];
+
+    for y in 0..height {
+        for x in 0..width {
+            let mask = stencil_image
+                .as_ref()
+                .map(|image| sample_luma(image, x, y, width, height))
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0);
+            let breakup = breakup_image
+                .as_ref()
+                .map(|image| sample_luma(image, x, y, width, height))
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0);
+            let blend = (opacity * mask * (0.35 + 0.65 * breakup)).clamp(0.0, 1.0);
+            let mut base_pixel = *output.get_pixel(x, y);
+
+            if material.is_decal() && base_color_png.is_none() {
+                base_pixel = image::Rgba([
+                    color[0],
+                    color[1],
+                    color[2],
+                    (blend * 255.0).round() as u8,
+                ]);
+            } else {
+                let inv = 1.0 - blend;
+                base_pixel = image::Rgba([
+                    (f32::from(base_pixel[0]) * inv + f32::from(color[0]) * blend).round() as u8,
+                    (f32::from(base_pixel[1]) * inv + f32::from(color[1]) * blend).round() as u8,
+                    (f32::from(base_pixel[2]) * inv + f32::from(color[2]) * blend).round() as u8,
+                    if material.is_decal() {
+                        (blend * 255.0).round() as u8
+                    } else {
+                        255
+                    },
+                ]);
+            }
+
+            output.put_pixel(x, y, base_pixel);
+        }
+    }
+
+    encode_png(&output)
+}
+
+fn build_screen_placeholder_textures(
+    material: &mtl::SubMaterial,
+    support_mask_png: Option<Vec<u8>>,
+    pixel_layout_png: Option<Vec<u8>>,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    let family = material.shader_family();
+    if !matches!(family, mtl::ShaderFamily::DisplayScreen | mtl::ShaderFamily::UiPlane)
+        && !material.has_virtual_input("$RenderToTexture")
+    {
+        return None;
+    }
+
+    let support_mask = support_mask_png.as_deref().and_then(decode_png);
+    let pixel_layout = pixel_layout_png.as_deref().and_then(decode_png);
+    let (width, height) = support_mask
+        .as_ref()
+        .map(|image| (image.width(), image.height()))
+        .or_else(|| pixel_layout.as_ref().map(|image| (image.width(), image.height())))
+        .unwrap_or((96, 64));
+
+    let back_color = material
+        .public_param_rgb(&["BackColour"])
+        .or_else(|| {
+            let emissive = material.emissive_factor();
+            if emissive == [0.0, 0.0, 0.0] {
+                None
+            } else {
+                Some(emissive)
+            }
+        })
+        .unwrap_or([0.08, 0.22, 0.35]);
+    let accent_color = [
+        (back_color[0] * 1.6 + 0.15).clamp(0.0, 1.0),
+        (back_color[1] * 1.5 + 0.15).clamp(0.0, 1.0),
+        (back_color[2] * 1.8 + 0.20).clamp(0.0, 1.0),
+    ];
+    let grid_x = material
+        .public_param_f32(&["PixelGridTilingX"])
+        .unwrap_or(8.0)
+        .abs()
+        .max(1.0);
+    let grid_y = material
+        .public_param_f32(&["PixelGridTilingY"])
+        .unwrap_or(6.0)
+        .abs()
+        .max(1.0);
+
+    let mut diffuse = image::RgbaImage::new(width, height);
+    let mut emissive = image::RgbaImage::new(width, height);
+    for y in 0..height {
+        for x in 0..width {
+            let u = if width <= 1 {
+                0.0
+            } else {
+                x as f32 / (width - 1) as f32
+            };
+            let v = if height <= 1 {
+                0.0
+            } else {
+                y as f32 / (height - 1) as f32
+            };
+
+            let stripe = if (u * grid_x * 4.0).fract() < 0.08 || (v * grid_y * 4.0).fract() < 0.08 {
+                1.0
+            } else {
+                0.0
+            };
+            let scanline = if ((v * height.max(2) as f32 / 2.0).fract()) < 0.5 {
+                0.92
+            } else {
+                0.74
+            };
+            let support = support_mask
+                .as_ref()
+                .map(|image| sample_luma(image, x, y, width, height))
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0);
+            let pixel_grid = pixel_layout
+                .as_ref()
+                .map(|image| sample_luma(image, x, y, width, height))
+                .unwrap_or(stripe)
+                .clamp(0.0, 1.0);
+
+            let base_mix = (0.12 + 0.24 * support + 0.10 * pixel_grid).clamp(0.0, 1.0);
+            let emissive_mix = (0.35 + 0.65 * pixel_grid.max(stripe)) * support * scanline;
+            diffuse.put_pixel(
+                x,
+                y,
+                image::Rgba([
+                    (back_color[0] * base_mix * 255.0 + accent_color[0] * stripe * 28.0)
+                        .clamp(0.0, 255.0)
+                        .round() as u8,
+                    (back_color[1] * base_mix * 255.0 + accent_color[1] * stripe * 28.0)
+                        .clamp(0.0, 255.0)
+                        .round() as u8,
+                    (back_color[2] * base_mix * 255.0 + accent_color[2] * stripe * 28.0)
+                        .clamp(0.0, 255.0)
+                        .round() as u8,
+                    255,
+                ]),
+            );
+            emissive.put_pixel(
+                x,
+                y,
+                image::Rgba([
+                    (accent_color[0] * emissive_mix * 255.0).clamp(0.0, 255.0).round() as u8,
+                    (accent_color[1] * emissive_mix * 255.0).clamp(0.0, 255.0).round() as u8,
+                    (accent_color[2] * emissive_mix * 255.0).clamp(0.0, 255.0).round() as u8,
+                    255,
+                ]),
+            );
+        }
+    }
+
+    Some((encode_png(&diffuse)?, encode_png(&emissive)?))
+}
+
+fn build_emissive_texture(
+    material: &mtl::SubMaterial,
+    base_color_png: Option<&Vec<u8>>,
+    screen_emissive_png: Option<Vec<u8>>,
+) -> Option<Vec<u8>> {
+    if let Some(emissive_png) = screen_emissive_png {
+        return Some(emissive_png);
+    }
+
+    let emissive = material.emissive_factor();
+    if emissive == [0.0, 0.0, 0.0] {
+        return None;
+    }
+
+    let mut image = base_color_png
+        .and_then(|png| decode_png(png))
+        .unwrap_or_else(|| make_solid_image(64, 64, material.diffuse, 255));
+    let scale = [
+        emissive[0].clamp(0.0, 1.0),
+        emissive[1].clamp(0.0, 1.0),
+        emissive[2].clamp(0.0, 1.0),
+    ];
+    for pixel in image.pixels_mut() {
+        pixel[0] = (f32::from(pixel[0]) * scale[0]).round() as u8;
+        pixel[1] = (f32::from(pixel[1]) * scale[1]).round() as u8;
+        pixel[2] = (f32::from(pixel[2]) * scale[2]).round() as u8;
+    }
+    encode_png(&image)
+}
+
+fn convert_png_to_occlusion(png_bytes: &[u8], invert: bool) -> Option<Vec<u8>> {
+    let source = decode_png(png_bytes)?;
+    let mut image = image::RgbaImage::new(source.width(), source.height());
+    for (x, y, pixel) in source.enumerate_pixels() {
+        let luminance = ((u16::from(pixel[0]) + u16::from(pixel[1]) + u16::from(pixel[2])) / 3) as u8;
+        let occlusion = if invert { 255u8.saturating_sub(luminance) } else { luminance };
+        image.put_pixel(x, y, image::Rgba([occlusion, occlusion, occlusion, 255]));
+    }
+    encode_png(&image)
+}
+
+fn build_occlusion_texture(
+    p4k: &MappedP4k,
+    material: &mtl::SubMaterial,
+    mip: u32,
+    png_cache: &mut PngCache,
+) -> Option<(Vec<u8>, &'static str)> {
+    let height_path = first_role_path(material, &[mtl::TextureSemanticRole::Height]);
+    if let Some(path) = height_path {
+        let png = load_texture_png(p4k, &path, mip, png_cache)?;
+        return convert_png_to_occlusion(&png, true).map(|bytes| (bytes, "height"));
+    }
+
+    let mask_path = first_role_path(
+        material,
+        &[
+            mtl::TextureSemanticRole::Dirt,
+            mtl::TextureSemanticRole::WearMask,
+            mtl::TextureSemanticRole::BlendMask,
+            mtl::TextureSemanticRole::Breakup,
+            mtl::TextureSemanticRole::PatternMask,
+            mtl::TextureSemanticRole::ScreenMask,
+            mtl::TextureSemanticRole::WearGloss,
+        ],
+    );
+    let path = mask_path?;
+    let png = load_texture_png(p4k, &path, mip, png_cache)?;
+    convert_png_to_occlusion(&png, false).map(|bytes| (bytes, "mask"))
+}
+
 fn load_material_textures(
     p4k: &MappedP4k,
     mtl: &mtl::MtlFile,
+    palette: Option<&mtl::TintPalette>,
     mip: u32,
     png_cache: &mut PngCache,
     include_normals: bool,
     experimental_textures: bool,
 ) -> MaterialTextures {
-    let diffuse = mtl
-        .materials
-        .iter()
-        .map(|m| {
-            // Load direct TexSlot1 diffuse textures. For HardSurface/LayerBlend
-            // materials, these are tileable detail patterns (greyscale) that get
-            // multiplied by base_color_factor (palette tint) in glTF rendering.
-            if let Some(path) = &m.diffuse_tex
-                && let Some(png) = cached_load(p4k, path, mip, png_cache, load_diffuse_texture)
-            {
-                return Some(png);
-            }
-            // Also try the first MatLayer's external .mtl for the diffuse texture
-            if let Some(layer) = m.layers.first() {
-                let p4k_path = datacore_path_to_p4k(&layer.path);
-                if let Some(layer_mtl) = try_load_mtl(p4k, &p4k_path)
-                    && let Some(layer_mat) = layer_mtl.materials.first()
-                    && let Some(tex_path) = &layer_mat.diffuse_tex
-                {
-                    return cached_load(p4k, tex_path, mip, png_cache, load_diffuse_texture);
-                }
-            }
+    let mut textures = empty_material_textures(mtl.materials.len());
+
+    for material in &mtl.materials {
+        let mut fallback_tags = Vec::new();
+
+        let screen_mask = load_semantic_texture_png(
+            p4k,
+            material,
+            &[
+                mtl::TextureSemanticRole::ScreenMask,
+                mtl::TextureSemanticRole::PatternMask,
+            ],
+            mip,
+            png_cache,
+        );
+        let pixel_layout = load_semantic_texture_png(
+            p4k,
+            material,
+            &[mtl::TextureSemanticRole::ScreenPixelLayout],
+            mip,
+            png_cache,
+        );
+        let screen_placeholder = build_screen_placeholder_textures(material, screen_mask, pixel_layout);
+
+        let direct_diffuse = material
+            .diffuse_tex
+            .as_ref()
+            .and_then(|path| load_texture_png(p4k, path, mip, png_cache));
+        let prefer_layered_base = !material.layers.is_empty()
+            && matches!(
+                material.shader_family(),
+                mtl::ShaderFamily::HardSurface
+                    | mtl::ShaderFamily::LayerBlendV2
+                    | mtl::ShaderFamily::Layer
+                    | mtl::ShaderFamily::Illum
+            );
+        let layered_base = if prefer_layered_base {
+            build_layered_base_color_texture(p4k, material, palette, mip, png_cache)
+        } else {
             None
-        })
-        .collect();
-
-    // Resolve normal texture path per submaterial and check UV compatibility.
-    // Normal/roughness textures that come from a different texture set than the diffuse
-    // (e.g., tileable normal on atlas-UV'd mesh) use different UV mappings.
-    // glTF only supports one texCoord per texture, so mismatched UVs produce noise.
-    let normal_paths: Vec<Option<String>> = mtl.materials.iter().map(|m| {
-        // Direct normal_tex from TexSlot2
-        if let Some(path) = &m.normal_tex {
-            return Some(path.clone());
+        };
+        let used_layered_base = layered_base.is_some();
+        let mut diffuse = if used_layered_base {
+            layered_base.clone().or(direct_diffuse.clone())
+        } else {
+            direct_diffuse.clone().or(layered_base.clone())
+        };
+        if used_layered_base {
+            push_fallback_tag(&mut fallback_tags, "layered_base_color");
         }
-        // Fallback: layer MTL's normal_tex
-        m.layers.first().and_then(|layer| {
-            let p4k_path = datacore_path_to_p4k(&layer.path);
-            try_load_mtl(p4k, &p4k_path)
-                .and_then(|lm| lm.materials.first()
-                    .and_then(|lmat| lmat.normal_tex.clone()))
-        })
-    }).collect();
 
-    let normal = if !include_normals {
-        vec![None; mtl.materials.len()]
-    } else {
-        mtl.materials
-            .iter()
-            .zip(normal_paths.iter())
-            .map(|(m, normal_path)| {
-                let normal_mip = mip;
-                let Some(path) = normal_path else { return None };
-                // Skip if the normal texture uses different UVs than the diffuse.
-                // Detect by checking if the texture base names share a common prefix.
-                // Atlas diffuse + tileable normal = UV mismatch → skip.
+        if matches!(material.shader_family(), mtl::ShaderFamily::Illum) {
+            if let Some(blended) = build_illum_blend_texture(p4k, material, diffuse.as_ref(), mip, png_cache) {
+                diffuse = Some(blended);
+                push_fallback_tag(&mut fallback_tags, "illum_blend_fallback");
+            }
+        }
+
+        if let Some(stencil) = build_stencil_fallback_texture(p4k, material, palette, diffuse.as_ref(), mip, png_cache) {
+            diffuse = Some(stencil);
+            push_fallback_tag(&mut fallback_tags, "stencil_fallback");
+        }
+
+        if diffuse.is_none() {
+            if let Some((placeholder_diffuse, _)) = screen_placeholder.as_ref() {
+                diffuse = Some(placeholder_diffuse.clone());
+                push_fallback_tag(&mut fallback_tags, "rtt_placeholder");
+            }
+        }
+
+        let normal_path = if let Some(path) = &material.normal_tex {
+            Some(path.clone())
+        } else {
+            material.layers.first().and_then(|layer| {
+                let p4k_path = datacore_path_to_p4k(&layer.path);
+                try_load_mtl(p4k, &p4k_path).and_then(|layer_mtl| {
+                    layer_mtl
+                        .materials
+                        .first()
+                        .and_then(|layer_material| layer_material.normal_tex.clone())
+                })
+            })
+        };
+
+        let normal = if !include_normals {
+            None
+        } else if let Some(path) = normal_path.as_ref() {
+            if !experimental_textures {
+                if let Some(diffuse_path) = material.diffuse_tex.as_ref() {
+                    if !textures_share_uv_space(diffuse_path, path) {
+                        log::debug!("  skipping mismatched normal: diffuse={diffuse_path}, normal={path}");
+                        None
+                    } else {
+                        cached_load(p4k, path, mip, png_cache, load_normal_texture)
+                    }
+                } else {
+                    cached_load(p4k, path, mip, png_cache, load_normal_texture)
+                }
+            } else {
+                cached_load(p4k, path, mip, png_cache, load_normal_texture)
+            }
+        } else {
+            None
+        };
+
+        let roughness = if !include_normals {
+            None
+        } else if let Some(path) = normal_path.as_ref() {
+            if !path.contains("_ddna") {
+                None
+            } else {
                 if !experimental_textures {
-                    if let Some(ref dtex) = m.diffuse_tex {
-                        if !textures_share_uv_space(dtex, path) {
-                            log::debug!("  skipping mismatched normal: diffuse={dtex}, normal={path}");
-                            return None;
+                    if let Some(diffuse_path) = material.diffuse_tex.as_ref() {
+                        if !textures_share_uv_space(diffuse_path, path) {
+                            None
+                        } else {
+                            let cache_key = format!("{path}@roughness_mip{mip}");
+                            if let Some(cached) = png_cache.get(&cache_key) {
+                                cached.clone()
+                            } else {
+                                let result = load_roughness_texture(p4k, path, mip);
+                                png_cache.insert(cache_key, result.clone());
+                                result
+                            }
+                        }
+                    } else {
+                        let cache_key = format!("{path}@roughness_mip{mip}");
+                        if let Some(cached) = png_cache.get(&cache_key) {
+                            cached.clone()
+                        } else {
+                            let result = load_roughness_texture(p4k, path, mip);
+                            png_cache.insert(cache_key, result.clone());
+                            result
                         }
                     }
-                }
-                cached_load(p4k, path, normal_mip, png_cache, load_normal_texture)
-            })
-            .collect()
-    };
-
-    // Extract per-pixel roughness from the alpha mips of _ddna normal maps.
-    // Only when the normal texture is UV-compatible (same check as above).
-    let roughness = if !include_normals {
-        vec![None; mtl.materials.len()]
-    } else {
-        mtl.materials
-            .iter()
-            .zip(normal_paths.iter())
-            .map(|(m, normal_path)| {
-                let Some(tif_path) = normal_path else { return None };
-                if !tif_path.contains("_ddna") {
-                    return None;
-                }
-                if !experimental_textures {
-                    if let Some(ref dtex) = m.diffuse_tex {
-                        if !textures_share_uv_space(dtex, tif_path) {
-                            return None;
-                        }
+                } else {
+                    let cache_key = format!("{path}@roughness_mip{mip}");
+                    if let Some(cached) = png_cache.get(&cache_key) {
+                        cached.clone()
+                    } else {
+                        let result = load_roughness_texture(p4k, path, mip);
+                        png_cache.insert(cache_key, result.clone());
+                        result
                     }
                 }
+            }
+        } else {
+            None
+        };
 
-                let cache_key = format!("{tif_path}@roughness_mip{mip}");
-                if let Some(cached) = png_cache.get(&cache_key) {
-                    return cached.clone();
-                }
+        let emissive = build_emissive_texture(
+            material,
+            diffuse.as_ref(),
+            screen_placeholder.as_ref().map(|(_, emissive)| emissive.clone()),
+        );
+        if emissive.is_some() {
+            push_fallback_tag(&mut fallback_tags, if material.has_virtual_input("$RenderToTexture") {
+                "screen_emissive_placeholder"
+            } else {
+                "emissive_texture"
+            });
+        }
 
-                let result = load_roughness_texture(p4k, tif_path, mip);
-                png_cache.insert(cache_key, result.clone());
-                result
-            })
-            .collect()
-    };
+        let occlusion = build_occlusion_texture(p4k, material, mip, png_cache).map(|(bytes, source)| {
+            push_fallback_tag(
+                &mut fallback_tags,
+                if source == "height" {
+                    "occlusion_from_height"
+                } else {
+                    "occlusion_from_mask"
+                },
+            );
+            bytes
+        });
 
-    MaterialTextures { diffuse, normal, roughness }
+        textures.diffuse.push(diffuse.clone());
+        textures.normal.push(normal.clone());
+        textures.roughness.push(roughness.clone());
+        textures.emissive.push(emissive.clone());
+        textures.occlusion.push(occlusion.clone());
+        textures.diffuse_transform.push(
+            diffuse
+                .as_ref()
+                .and_then(|_| simple_texture_transform(material, Some(mtl::TextureSemanticRole::BaseColor))),
+        );
+        textures.normal_transform.push(
+            normal
+                .as_ref()
+                .and_then(|_| simple_texture_transform(material, Some(mtl::TextureSemanticRole::NormalGloss))),
+        );
+        textures.roughness_transform.push(
+            roughness
+                .as_ref()
+                .and_then(|_| simple_texture_transform(material, Some(mtl::TextureSemanticRole::Height))),
+        );
+        textures.emissive_transform.push(
+            emissive
+                .as_ref()
+                .and_then(|_| {
+                    if matches!(material.shader_family(), mtl::ShaderFamily::DisplayScreen | mtl::ShaderFamily::UiPlane)
+                        || material.has_virtual_input("$RenderToTexture")
+                    {
+                        simple_texture_transform(material, Some(mtl::TextureSemanticRole::ScreenPixelLayout))
+                            .or_else(|| simple_texture_transform(material, Some(mtl::TextureSemanticRole::ScreenMask)))
+                    } else {
+                        simple_texture_transform(material, Some(mtl::TextureSemanticRole::BaseColor))
+                    }
+                }),
+        );
+        textures.occlusion_transform.push(
+            occlusion
+                .as_ref()
+                .and_then(|_| {
+                    if material.decoded_string_gen_mask().has_parallax_occlusion_mapping {
+                        simple_texture_transform(material, Some(mtl::TextureSemanticRole::Height))
+                    } else {
+                        simple_texture_transform(material, Some(mtl::TextureSemanticRole::BlendMask))
+                            .or_else(|| simple_texture_transform(material, Some(mtl::TextureSemanticRole::Dirt)))
+                    }
+                }),
+        );
+        textures.bundled_fallbacks.push(fallback_tags);
+    }
+
+    textures
 }
 
 /// Check if a diffuse and normal texture are from the same texture set (same UV space).
@@ -1381,7 +3450,7 @@ fn textures_share_uv_space(diffuse_path: &str, normal_path: &str) -> bool {
 }
 
 /// Load a texture with caching by path — prevents redundant DDS decode + PNG encode.
-fn cached_load(
+pub(crate) fn cached_load(
     p4k: &MappedP4k,
     path: &str,
     mip: u32,
@@ -1397,7 +3466,18 @@ fn cached_load(
     result
 }
 
-fn load_diffuse_texture(p4k: &MappedP4k, tif_path: &str, mip_level: u32) -> Option<Vec<u8>> {
+fn encode_png_rgba(width: u32, height: u32, rgba: Vec<u8>) -> Option<Vec<u8>> {
+    let img = image::RgbaImage::from_raw(width, height, rgba)?;
+    let mut png_buf = Vec::new();
+    img.write_to(
+        &mut std::io::Cursor::new(&mut png_buf),
+        image::ImageFormat::Png,
+    )
+    .ok()?;
+    Some(png_buf)
+}
+
+pub(crate) fn load_diffuse_texture(p4k: &MappedP4k, tif_path: &str, mip_level: u32) -> Option<Vec<u8>> {
     if tif_path.starts_with('$') {
         return None;
     }
@@ -1422,31 +3502,15 @@ fn load_diffuse_texture(p4k: &MappedP4k, tif_path: &str, mip_level: u32) -> Opti
     let (w, h) = dds.dimensions(mip);
     let rgba = dds.decode_rgba(mip).ok()?;
 
-    let img = image::RgbaImage::from_raw(w, h, rgba)?;
-    let mut png_buf = Vec::new();
-    img.write_to(
-        &mut std::io::Cursor::new(&mut png_buf),
-        image::ImageFormat::Png,
-    )
-    .ok()?;
-
-    Some(png_buf)
+    encode_png_rgba(w, h, rgba)
 }
 
-/// Load a normal map texture from a `_ddna.dds` file.
+/// Load a normal-gloss texture as a PNG while preserving DDNA smoothness in alpha.
 ///
-/// CryEngine stores normals in DXT5nm (BC3n) encoding:
-/// - Alpha channel = X component of the normal
-/// - Green channel = Y component of the normal
-/// - Z is reconstructed: sqrt(1 - X² - Y²)
-///
-/// Output: RGB PNG where R=X, G=Y, B=Z in tangent space.
-/// Load a normal map texture from a _ddna DDS file.
-///
-/// The DDS decoder outputs RGBA for BC5 with Z reconstructed, but degenerate
-/// pixels (background/padding) can have Z≈0 which breaks Cycles. We re-read
-/// R+G, ensure Z>0, and output a clean normal map PNG.
-fn load_normal_texture(p4k: &MappedP4k, tif_path: &str, mip_level: u32) -> Option<Vec<u8>> {
+/// The RGB channels come from the decoded normal texture. When sibling alpha mips
+/// are present, their smoothness values are copied into the PNG alpha channel so
+/// downstream consumers can derive roughness without Rust-side reinterpretation.
+pub(crate) fn load_normal_texture(p4k: &MappedP4k, tif_path: &str, mip_level: u32) -> Option<Vec<u8>> {
     if tif_path.starts_with('$') {
         return None;
     }
@@ -1483,19 +3547,18 @@ fn load_normal_texture(p4k: &MappedP4k, tif_path: &str, mip_level: u32) -> Optio
 
     let mip = (mip_level as usize).min(dds.mip_count().saturating_sub(1));
     let (w, h) = dds.dimensions(mip);
-    let rgba = dds.decode_rgba(mip).ok()?;
+    let mut rgba = dds.decode_rgba(mip).ok()?;
 
-    // The DDS decoder already handles SNorm→unsigned conversion and Z reconstruction
-    // in expand_normal_map. Output is [0..255] where 128 = zero, ready for glTF.
-    let img = image::RgbaImage::from_raw(w, h, rgba)?;
-    let mut png_buf = Vec::new();
-    img.write_to(
-        &mut std::io::Cursor::new(&mut png_buf),
-        image::ImageFormat::Png,
-    )
-    .ok()?;
+    if dds.has_alpha_mips()
+        && let Ok(smoothness) = dds.decode_alpha_mip(mip)
+        && smoothness.len() * 4 == rgba.len()
+    {
+        for (index, value) in smoothness.iter().enumerate() {
+            rgba[index * 4 + 3] = *value;
+        }
+    }
 
-    Some(png_buf)
+    encode_png_rgba(w, h, rgba)
 }
 
 /// Extract per-pixel roughness from the alpha mips of a _ddna normal map DDS.
@@ -1503,7 +3566,7 @@ fn load_normal_texture(p4k: &MappedP4k, tif_path: &str, mip_level: u32) -> Optio
 /// CryEngine stores smoothness in separate sibling files (.7a, .6a, ...) as BC4 compressed.
 /// We convert smoothness → roughness (1-smoothness) and pack into a glTF metallicRoughness
 /// texture: R=0, G=roughness, B=metallic(0), A=255.
-fn load_roughness_texture(p4k: &MappedP4k, tif_path: &str, mip_level: u32) -> Option<Vec<u8>> {
+pub(crate) fn load_roughness_texture(p4k: &MappedP4k, tif_path: &str, mip_level: u32) -> Option<Vec<u8>> {
     let dds_path = tif_path
         .strip_suffix(".tif")
         .map(|base| format!("{base}.dds"))
@@ -1665,7 +3728,6 @@ fn resolve_paint_override(
     root_node: &starbreaker_datacore::loadout::LoadoutNode,
     default_palette: Option<mtl::TintPalette>,
     default_mtl: Option<mtl::MtlFile>,
-    opts: &ExportOptions,
 ) -> (Option<mtl::TintPalette>, Option<mtl::MtlFile>) {
     // Find paint item in loadout children.
     let paint_node = root_node.children.iter()
@@ -1723,32 +3785,9 @@ fn resolve_paint_override(
             }
             log::info!("  matched SubGeometry[{idx}] tag='{tag}'");
 
-            // Extract palette from this SubGeometry's Geometry.Palette.RootRecord.root
-            let palette = (|| -> Option<mtl::TintPalette> {
-                let geom_data = get_value_field(sub, "Geometry")?;
-                let palette_ref = get_value_field(geom_data, "Palette")?;
-                let root_record = get_value_field(palette_ref, "RootRecord")?;
-                let root = get_value_field(root_record, "root")?;
-
-                let read_entry = |entry_name: &str| -> [f32; 3] {
-                    let entry = get_value_field(root, entry_name);
-                    let tint = entry.and_then(|e| get_value_field(e, "tintColor"));
-                    let r = tint.and_then(|t| get_value_u8(t, "r")).unwrap_or(128);
-                    let g = tint.and_then(|t| get_value_u8(t, "g")).unwrap_or(128);
-                    let b = tint.and_then(|t| get_value_u8(t, "b")).unwrap_or(128);
-                    [
-                        srgb_to_linear(r as f32 / 255.0),
-                        srgb_to_linear(g as f32 / 255.0),
-                        srgb_to_linear(b as f32 / 255.0),
-                    ]
-                };
-                Some(mtl::TintPalette {
-                    primary: read_entry("entryA"),
-                    secondary: read_entry("entryB"),
-                    tertiary: read_entry("entryC"),
-                    glass: read_entry("glassColor"),
-                })
-            })();
+            // Extract palette from this SubGeometry's Geometry.Palette.RootRecord.root.
+            let palette = get_value_field(sub, "Geometry")
+                .and_then(|geometry| extract_subgeometry_palette(geometry, Some(paint_node.entity_name.clone())));
 
             if let Some(ref p) = palette {
                 log::info!(
@@ -1764,13 +3803,24 @@ fn resolve_paint_override(
                 .and_then(|m| get_value_string(m, "path"))
                 .filter(|p| !p.is_empty());
 
-            let mtl = if let Some(mtl_path) = mtl_path {
+            let override_info = mtl::PaintOverrideInfo {
+                paint_item_name: paint_node.entity_name.clone(),
+                subgeometry_tag: tag.to_string(),
+                subgeometry_index: idx,
+                material_path: mtl_path.map(|path| datacore_path_to_p4k(path).replace('\\', "/")),
+            };
+
+            let mut mtl = if let Some(mtl_path) = mtl_path {
                 log::info!("  paint material override: {mtl_path}");
                 let p4k_path = datacore_path_to_p4k(mtl_path);
-                try_load_mtl(p4k, &p4k_path).or(default_mtl)
+                try_load_mtl(p4k, &p4k_path).or_else(|| default_mtl.clone())
             } else {
-                default_mtl
+                default_mtl.clone()
             };
+
+            if let Some(materials) = mtl.as_mut() {
+                materials.paint_override = Some(override_info);
+            }
 
             return (palette.or(default_palette), mtl);
         }
@@ -1778,6 +3828,225 @@ fn resolve_paint_override(
 
     log::warn!("  paint tag '{subgeo_tag}' not found in SubGeometry entries");
     (default_palette, default_mtl)
+}
+
+/// Enumerate all available paint variants for a ship entity by inspecting every
+/// SubGeometry entry that carries a @Tag.  For each entry we read the variant's
+/// material path and load the MTL file, then derive a stable `paint/…` ID from
+/// the sanitized tag string.  Entries without a tag (the default material) are
+/// skipped.  Duplicate tags (some entities repeat SubGeometry entries) are
+/// de-duplicated.
+fn enumerate_paint_variants_for_entity(
+    db: &Database,
+    p4k: &MappedP4k,
+    entity_record: &Record,
+    display_names: &HashMap<String, String>,
+) -> Vec<mtl::PaintVariant> {
+    use starbreaker_datacore::query::value::Value;
+
+    let compiled = match db.compile_path::<Value>(
+        entity_record.struct_id(),
+        "Components[SGeometryResourceParams]",
+    ) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let components = db.query::<Value>(&compiled, entity_record).unwrap_or_default();
+
+    let mut variants: Vec<mtl::PaintVariant> = Vec::new();
+
+    for component in &components {
+        let geom_node = match get_value_field(component, "Geometry") {
+            Some(g) => g,
+            None => continue,
+        };
+        let sub_arr = match get_value_array(geom_node, "SubGeometry") {
+            Some(a) => a,
+            None => continue,
+        };
+
+        for sub in sub_arr {
+            let tag = get_value_string(sub, "Tags").unwrap_or("").trim();
+            // Skip the default (no-paint) SubGeometry entry.
+            if tag.is_empty() {
+                continue;
+            }
+            // Skip duplicates — some entities repeat SubGeometry entries.
+            if variants.iter().any(|v| v.subgeometry_tag.eq_ignore_ascii_case(tag)) {
+                continue;
+            }
+
+            // Derive the P4K-relative material path, normalised to backslashes for P4K lookup
+            // and stored with forward slashes for output JSON.
+            let p4k_mtl_path: Option<String> = get_value_field(sub, "Geometry")
+                .and_then(|g| get_value_field(g, "Material"))
+                .and_then(|m| get_value_string(m, "path"))
+                .filter(|p| !p.is_empty())
+                .map(|p| datacore_path_to_p4k(p));
+
+            // Load the material file for this variant using the backslash P4K path.
+            let materials = p4k_mtl_path.as_deref().and_then(|p| try_load_mtl(p4k, p));
+
+            // Store forward-slash version for output.
+            let material_path = p4k_mtl_path.map(|p| p.replace('\\', "/"));
+
+            // Derive a stable canonical palette_id directly from the SubGeometry tag.
+            // E.g. "Paint_Aurora_Mk2_Pink_Green_Purple" → "palette/aurora_mk2_pink_green_purple".
+            let sanitized_tag: String = tag
+                .chars()
+                .map(|ch| {
+                    if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                        ch.to_ascii_lowercase()
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            let canonical_tag = sanitized_tag
+                .strip_prefix("paint_")
+                .unwrap_or(sanitized_tag.as_str());
+            let palette_id = Some(format!("palette/{canonical_tag}"));
+            // Try to look up a localized display name using the sanitized tag.
+            let display_name = display_names.get(sanitized_tag.as_str()).cloned();
+            let palette = get_value_field(sub, "Geometry")
+                .and_then(|geometry| extract_subgeometry_palette(geometry, Some(canonical_tag.to_string())))
+                .map(|mut palette| {
+                    if palette.display_name.is_none() {
+                        palette.display_name = display_name.clone();
+                    }
+                    palette
+                });
+
+            log::info!(
+                "  paint variant: tag={tag:?}, material={:?}, palette_id={:?}, display={:?}",
+                material_path,
+                palette_id,
+                display_name,
+            );
+
+            variants.push(mtl::PaintVariant {
+                subgeometry_tag: tag.to_string(),
+                palette_id,
+                palette,
+                display_name,
+                material_path,
+                materials,
+            });
+        }
+    }
+
+    extend_with_palette_only_paint_variants(db, entity_record, display_names, &mut variants);
+
+    variants
+}
+
+fn extend_with_palette_only_paint_variants(
+    db: &Database,
+    entity_record: &Record,
+    display_names: &HashMap<String, String>,
+    variants: &mut Vec<mtl::PaintVariant>,
+) {
+    use starbreaker_datacore::query::value::Value;
+    use starbreaker_datacore::QueryResultExt;
+
+    let family_keys = tint_palette_family_keys(db.resolve_string2(entity_record.name_offset));
+    if family_keys.is_empty() {
+        return;
+    }
+
+    let Ok(tags_compiled) = db
+        .compile_rooted::<String>("EntityClassDefinition.Components[SAttachableComponentParams].AttachDef.Tags")
+        .optional()
+    else {
+        return;
+    };
+    let Ok(geometry_compiled) = db
+        .compile_rooted::<Value>("EntityClassDefinition.Components[SGeometryResourceParams]")
+        .optional()
+    else {
+        return;
+    };
+
+    let mut seen_palette_ids: HashSet<String> = variants
+        .iter()
+        .filter_map(|variant| variant.palette_id.clone())
+        .collect();
+
+    for record in db.records_by_type_name("EntityClassDefinition") {
+        if !db.is_main_record(record) {
+            continue;
+        }
+        let file_path = db.resolve_string(record.file_name_offset).to_lowercase();
+        if !file_path.contains("entities/scitem/ships/paints/") {
+            continue;
+        }
+
+        let Some(tags) = tags_compiled
+            .as_ref()
+            .and_then(|compiled| db.query_single::<String>(compiled, record).ok().flatten())
+        else {
+            continue;
+        };
+        if !paint_attach_tags_match_family(&tags, &family_keys) {
+            continue;
+        }
+
+        let full_name = db.resolve_string2(record.name_offset);
+        let short_name = full_name.rsplit('.').next().unwrap_or(full_name).to_lowercase();
+        let canonical_tag = short_name
+            .strip_prefix("paint_")
+            .unwrap_or(short_name.as_str())
+            .to_string();
+        let palette_id = format!("palette/{canonical_tag}");
+        if !seen_palette_ids.insert(palette_id.clone()) {
+            continue;
+        }
+
+        let display_name = display_names
+            .get(&short_name)
+            .cloned()
+            .or_else(|| display_names.get(&canonical_tag).cloned());
+        let components = geometry_compiled
+            .as_ref()
+            .and_then(|compiled| db.query::<Value>(compiled, record).ok())
+            .unwrap_or_default();
+        let palette = components
+            .iter()
+            .filter_map(|component| get_value_field(component, "Geometry"))
+            .find_map(|geometry| extract_subgeometry_palette(geometry, Some(canonical_tag.clone())))
+            .map(|mut palette| {
+                if palette.display_name.is_none() {
+                    palette.display_name = display_name.clone();
+                }
+                palette
+            });
+
+        if palette.is_none() {
+            continue;
+        }
+
+        let subgeometry_tag = tags
+            .split_whitespace()
+            .find_map(|token| token.strip_prefix('@'))
+            .map(str::to_string);
+
+        variants.push(mtl::PaintVariant {
+            subgeometry_tag: subgeometry_tag.unwrap_or_else(|| short_name.clone()),
+            palette_id: Some(palette_id),
+            palette,
+            display_name,
+            material_path: None,
+            materials: None,
+        });
+    }
+}
+
+fn paint_attach_tags_match_family(tags: &str, family_keys: &[String]) -> bool {
+    let tokens: HashSet<String> = tags.split_whitespace().map(|token| token.to_lowercase()).collect();
+    family_keys
+        .iter()
+        .map(|key| format!("paint_{key}"))
+        .any(|candidate| tokens.contains(&candidate))
 }
 
 /// Helper: get an object field from a DataCore Value.
@@ -1801,6 +4070,22 @@ fn get_value_string<'a>(val: &starbreaker_datacore::query::value::Value<'a>, nam
         }
     }
     None
+}
+
+pub fn query_animation_controller_source(
+    db: &Database,
+    record: &Record,
+) -> Option<crate::animation::AnimationControllerSource> {
+    let compiled = db
+        .compile_path::<Value>(record.struct_id(), "Components[SAnimationControllerParams]")
+        .ok()?;
+    let component = db.query_single::<Value>(&compiled, record).ok().flatten()?;
+    let animation_database = get_value_string(&component, "AnimationDatabase")?.to_string();
+    let animation_controller = get_value_string(&component, "AnimationController")?.to_string();
+    Some(crate::animation::AnimationControllerSource {
+        animation_database,
+        animation_controller,
+    })
 }
 
 /// Helper: get an array field from a DataCore Value.
@@ -1831,6 +4116,88 @@ fn get_value_u8(val: &starbreaker_datacore::query::value::Value, name: &str) -> 
     None
 }
 
+/// Helper: get an f32-like field from a DataCore Value.
+fn get_value_f32(val: &starbreaker_datacore::query::value::Value, name: &str) -> Option<f32> {
+    if let starbreaker_datacore::query::value::Value::Object { fields, .. } = val {
+        for (k, v) in fields {
+            if *k == name {
+                return match v {
+                    starbreaker_datacore::query::value::Value::Float(n) => Some(*n),
+                    starbreaker_datacore::query::value::Value::Double(n) => Some(*n as f32),
+                    starbreaker_datacore::query::value::Value::UInt8(n) => Some(*n as f32),
+                    starbreaker_datacore::query::value::Value::UInt16(n) => Some(*n as f32),
+                    starbreaker_datacore::query::value::Value::UInt32(n) => Some(*n as f32),
+                    _ => None,
+                };
+            }
+        }
+    }
+    None
+}
+
+fn extract_subgeometry_palette(
+    geometry: &starbreaker_datacore::query::value::Value,
+    source_name: Option<String>,
+) -> Option<mtl::TintPalette> {
+    let palette_ref = get_value_field(geometry, "Palette")?;
+    let root_record = get_value_field(palette_ref, "RootRecord")?;
+    let root = get_value_field(root_record, "root")?;
+
+    let read_entry = |entry_name: &str| -> [f32; 3] {
+        let entry = get_value_field(root, entry_name);
+        let tint = entry.and_then(|value| get_value_field(value, "tintColor"));
+        let r = tint.and_then(|value| get_value_u8(value, "r")).unwrap_or(128);
+        let g = tint.and_then(|value| get_value_u8(value, "g")).unwrap_or(128);
+        let b = tint.and_then(|value| get_value_u8(value, "b")).unwrap_or(128);
+        [
+            srgb_to_linear(r as f32 / 255.0),
+            srgb_to_linear(g as f32 / 255.0),
+            srgb_to_linear(b as f32 / 255.0),
+        ]
+    };
+    let read_finish = |entry_name: &str| -> mtl::TintPaletteFinishEntry {
+        let entry = get_value_field(root, entry_name);
+        mtl::TintPaletteFinishEntry {
+            specular: entry.and_then(|value| read_rgb_value_field(value, "specColor")),
+            glossiness: entry.and_then(|value| get_value_f32(value, "glossiness")),
+        }
+    };
+
+    Some(mtl::TintPalette {
+        source_name,
+        display_name: None,
+        primary: read_entry("entryA"),
+        secondary: read_entry("entryB"),
+        tertiary: read_entry("entryC"),
+        glass: read_entry("glassColor"),
+        decal_color_r: read_rgb_value_field(root, "decalColorR"),
+        decal_color_g: read_rgb_value_field(root, "decalColorG"),
+        decal_color_b: read_rgb_value_field(root, "decalColorB"),
+        decal_texture: get_value_string(root, "decalTexture").map(str::to_string),
+        finish: mtl::TintPaletteFinish {
+            primary: read_finish("entryA"),
+            secondary: read_finish("entryB"),
+            tertiary: read_finish("entryC"),
+            glass: read_finish("glassColor"),
+        },
+    })
+}
+
+fn read_rgb_value_field(
+    value: &starbreaker_datacore::query::value::Value,
+    field_name: &str,
+) -> Option<[f32; 3]> {
+    let rgb = get_value_field(value, field_name)?;
+    let r = get_value_u8(rgb, "r")?;
+    let g = get_value_u8(rgb, "g")?;
+    let b = get_value_u8(rgb, "b")?;
+    Some([
+        srgb_to_linear(r as f32 / 255.0),
+        srgb_to_linear(g as f32 / 255.0),
+        srgb_to_linear(b as f32 / 255.0),
+    ])
+}
+
 /// Query the default tint palette colors from a DataCore entity.
 ///
 /// Strategy:
@@ -1838,17 +4205,18 @@ fn get_value_u8(val: &starbreaker_datacore::query::value::Value, name: &str) -> 
 ///    correct TintPaletteTree record, works when RootRecord is populated).
 /// 2. Fallback: search for a TintPaletteTree record matching the entity name.
 fn query_tint_palette(db: &Database, record: &Record) -> Option<mtl::TintPalette> {
+    let entity_name = db.resolve_string2(record.name_offset);
+    let short_name = entity_name.rsplit('.').next().unwrap_or(entity_name).to_lowercase();
+
     // Strategy 1: Query through the entity's Reference path.
     // This follows Components[SGeometryResourceParams].Geometry.Geometry.Palette.RootRecord
     // through the Reference to the TintPaletteTree and reads colors directly.
     let base = "Components[SGeometryResourceParams].Geometry.Geometry.Palette.RootRecord.root";
-    if let Some(palette) = query_tint_from_path(db, record, base) {
+    if let Some(palette) = query_tint_from_path(db, record, base, Some(short_name.clone())) {
         return Some(palette);
     }
 
     // Strategy 2: Find TintPaletteTree record by entity name convention.
-    let entity_name = db.resolve_string2(record.name_offset);
-    let short_name = entity_name.rsplit('.').next().unwrap_or(entity_name).to_lowercase();
     let tpt_si = db.struct_id("TintPaletteTree")?;
     // Find an exact match first (e.g., "rsi_zeus_cl"), not a substring match
     // that could pick up a paint variant like "aegs_gladius_black_grey_grey_geometric".
@@ -1859,7 +4227,169 @@ fn query_tint_palette(db: &Database, record: &Record) -> Option<mtl::TintPalette
             rec_short == short_name
         })?;
 
-    query_tint_from_record(db, palette_record)
+    query_tint_from_record(
+        db,
+        palette_record,
+        Some(short_name),
+    )
+}
+
+fn query_related_tint_palettes(
+    db: &Database,
+    record: &Record,
+    default_palette: Option<&mtl::TintPalette>,
+) -> Vec<mtl::TintPalette> {
+    let Some(tpt_si) = db.struct_id("TintPaletteTree") else {
+        return Vec::new();
+    };
+    let family_keys = tint_palette_family_keys(db.resolve_string2(record.name_offset));
+    if family_keys.is_empty() {
+        return Vec::new();
+    }
+
+    let mut seen = HashSet::new();
+    let mut palettes = Vec::new();
+    if let Some(palette) = default_palette.cloned() {
+        if let Some(source_name) = palette.source_name.clone() {
+            seen.insert(source_name);
+        }
+        palettes.push(palette);
+    }
+    for palette_record in db.records_of_type(tpt_si) {
+        let full_name = db.resolve_string2(palette_record.name_offset).to_lowercase();
+        let short_name = full_name.rsplit('.').next().unwrap_or(&full_name);
+        if !tint_palette_matches_family(short_name, &family_keys) {
+            continue;
+        }
+        if !seen.insert(short_name.to_string()) {
+            continue;
+        }
+        if let Some(palette) = query_tint_from_record(db, palette_record, Some(short_name.to_string())) {
+            palettes.push(palette);
+        }
+    }
+
+    palettes.sort_by(|left, right| left.source_name.cmp(&right.source_name));
+    palettes
+}
+
+fn tint_palette_family_keys(name: &str) -> Vec<String> {
+    let short_name = name
+        .rsplit('.')
+        .next()
+        .unwrap_or(name)
+        .rsplit('/')
+        .next()
+        .unwrap_or(name)
+        .to_lowercase();
+    if short_name.is_empty() {
+        return Vec::new();
+    }
+
+    let mut keys = vec![short_name.clone()];
+    if let Some((_, remainder)) = short_name.split_once('_')
+        && !remainder.is_empty()
+    {
+        keys.push(remainder.to_string());
+    }
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+fn tint_palette_matches_family(short_name: &str, family_keys: &[String]) -> bool {
+    family_keys.iter().any(|key| short_name == key || short_name.starts_with(&format!("{key}_")))
+}
+
+fn load_localization_map(p4k: &MappedP4k) -> HashMap<String, String> {
+    let data = p4k
+        .read_file("Data\\Localization\\english\\global.ini")
+        .unwrap_or_default();
+    parse_localization(&data)
+}
+
+fn parse_localization(data: &[u8]) -> HashMap<String, String> {
+    let text = String::from_utf8_lossy(data);
+    let mut map = HashMap::new();
+    for line in text.lines() {
+        let line = line.trim_start_matches('\u{feff}').trim();
+        if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            map.insert(key.trim().to_lowercase(), value.trim().to_string());
+        }
+    }
+    map
+}
+
+fn build_paint_display_name_map(db: &Database, localization: &HashMap<String, String>) -> HashMap<String, String> {
+    use starbreaker_datacore::QueryResultExt;
+
+    if localization.is_empty() {
+        return HashMap::new();
+    }
+
+    let Ok(loc_compiled) = db
+        .compile_rooted::<Value>(
+            "EntityClassDefinition.Components[SAttachableComponentParams].AttachDef.Localization.Name",
+        )
+        .optional()
+    else {
+        return HashMap::new();
+    };
+
+    let mut display_names = HashMap::new();
+    for record in db.records_by_type_name("EntityClassDefinition") {
+        if !db.is_main_record(record) {
+            continue;
+        }
+        let file_path = db.resolve_string(record.file_name_offset).to_lowercase();
+        if !file_path.contains("entities/scitem/ships/paints/") {
+            continue;
+        }
+        let Some(display_name) = loc_compiled
+            .as_ref()
+            .and_then(|compiled| db.query_single::<Value>(compiled, record).ok().flatten())
+            .and_then(|value| localization_key_from_value(&value))
+            .and_then(|key| localization.get(&key).cloned())
+        else {
+            continue;
+        };
+
+        let full_name = db.resolve_string2(record.name_offset);
+        let short_name = full_name.rsplit('.').next().unwrap_or(full_name).to_lowercase();
+        display_names.insert(short_name.clone(), display_name.clone());
+        if let Some(stripped) = short_name.strip_prefix("paint_") {
+            display_names.entry(stripped.to_string()).or_insert(display_name);
+        }
+    }
+
+    display_names
+}
+
+fn localization_key_from_value(value: &Value) -> Option<String> {
+    let key = match value {
+        Value::String(text) | Value::Locale(text) => text.to_string(),
+        _ => return None,
+    };
+    if key.is_empty() || key == "@LOC_UNINITIALIZED" || key == "@LOC_EMPTY" {
+        return None;
+    }
+    Some(key.strip_prefix('@').unwrap_or(&key).to_lowercase())
+}
+
+fn populate_palette_display_name(palette: &mut mtl::TintPalette, display_names: &HashMap<String, String>) {
+    if palette.display_name.is_some() {
+        return;
+    }
+    let Some(source_name) = palette.source_name.as_deref() else {
+        return;
+    };
+    let key = source_name.rsplit('.').next().unwrap_or(source_name).to_lowercase();
+    if let Some(display_name) = display_names.get(&key) {
+        palette.display_name = Some(display_name.clone());
+    }
 }
 
 /// Convert an sRGB 0.0-1.0 component to linear.
@@ -1872,7 +4402,12 @@ fn srgb_to_linear(c: f32) -> f32 {
 }
 
 /// Read tint palette colors from a path through an entity record.
-fn query_tint_from_path(db: &Database, record: &Record, base: &str) -> Option<mtl::TintPalette> {
+fn query_tint_from_path(
+    db: &Database,
+    record: &Record,
+    base: &str,
+    source_name: Option<String>,
+) -> Option<mtl::TintPalette> {
     let query_rgb = |entry: &str| -> [f32; 3] {
         let mut rgb = [0.5f32; 3];
         for (i, ch) in ["r", "g", "b"].iter().enumerate() {
@@ -1886,6 +4421,44 @@ fn query_tint_from_path(db: &Database, record: &Record, base: &str) -> Option<mt
         }
         rgb
     };
+    let query_finish_rgb = |entry: &str| -> Option<[f32; 3]> {
+        let mut rgb = [0.0f32; 3];
+        let mut found = false;
+        for (i, ch) in ["r", "g", "b"].iter().enumerate() {
+            let path = format!("{base}.{entry}.specColor.{ch}");
+            if let Ok(compiled) = db.compile_path::<u8>(record.struct_id(), &path)
+                && let Ok(Some(v)) = db.query_single::<u8>(&compiled, record)
+            {
+                found = true;
+                rgb[i] = srgb_to_linear(v as f32 / 255.0);
+            }
+        }
+        found.then_some(rgb)
+    };
+    let query_glossiness = |entry: &str| -> Option<f32> {
+        let path = format!("{base}.{entry}.glossiness");
+        let compiled = db.compile_path::<f32>(record.struct_id(), &path).ok()?;
+        db.query_single::<f32>(&compiled, record).ok().flatten()
+    };
+    let query_palette_rgb = |entry: &str| -> Option<[f32; 3]> {
+        let mut rgb = [0.0f32; 3];
+        let mut found = false;
+        for (i, ch) in ["r", "g", "b"].iter().enumerate() {
+            let path = format!("{base}.{entry}.{ch}");
+            if let Ok(compiled) = db.compile_path::<u8>(record.struct_id(), &path)
+                && let Ok(Some(v)) = db.query_single::<u8>(&compiled, record)
+            {
+                found = true;
+                rgb[i] = srgb_to_linear(v as f32 / 255.0);
+            }
+        }
+        found.then_some(rgb)
+    };
+    let query_string = |entry: &str| -> Option<String> {
+        let path = format!("{base}.{entry}");
+        let compiled = db.compile_path::<String>(record.struct_id(), &path).ok()?;
+        db.query_single::<String>(&compiled, record).ok().flatten()
+    };
 
     // Quick check: can we even query this path?
     let test_path = format!("{base}.entryA.tintColor.r");
@@ -1893,24 +4466,156 @@ fn query_tint_from_path(db: &Database, record: &Record, base: &str) -> Option<mt
     let _val = db.query_single::<u8>(&compiled, record).ok().flatten()?;
 
     Some(mtl::TintPalette {
+        source_name,
+        display_name: None,
         primary: query_rgb("entryA"),
         secondary: query_rgb("entryB"),
         tertiary: query_rgb("entryC"),
         glass: query_rgb("glassColor"),
+        decal_color_r: query_palette_rgb("decalColorR"),
+        decal_color_g: query_palette_rgb("decalColorG"),
+        decal_color_b: query_palette_rgb("decalColorB"),
+        decal_texture: query_string("decalTexture"),
+        finish: mtl::TintPaletteFinish {
+            primary: mtl::TintPaletteFinishEntry {
+                specular: query_finish_rgb("entryA"),
+                glossiness: query_glossiness("entryA"),
+            },
+            secondary: mtl::TintPaletteFinishEntry {
+                specular: query_finish_rgb("entryB"),
+                glossiness: query_glossiness("entryB"),
+            },
+            tertiary: mtl::TintPaletteFinishEntry {
+                specular: query_finish_rgb("entryC"),
+                glossiness: query_glossiness("entryC"),
+            },
+            glass: mtl::TintPaletteFinishEntry {
+                specular: query_finish_rgb("glassColor"),
+                glossiness: query_glossiness("glassColor"),
+            },
+        },
     })
 }
 
 /// Read tint palette colors from a TintPaletteTree record directly.
-fn query_tint_from_record(db: &Database, record: &Record) -> Option<mtl::TintPalette> {
-    query_tint_from_path(db, record, "root")
+fn query_tint_from_record(
+    db: &Database,
+    record: &Record,
+    source_name: Option<String>,
+) -> Option<mtl::TintPalette> {
+    query_tint_from_path(db, record, "root", source_name)
 }
 
-fn try_load_mtl(p4k: &MappedP4k, p4k_path: &str) -> Option<mtl::MtlFile> {
+pub(crate) fn try_load_mtl(p4k: &MappedP4k, p4k_path: &str) -> Option<mtl::MtlFile> {
     let entry = p4k.entry_case_insensitive(p4k_path)?;
     let data = p4k.read(entry).ok()?;
     let mut mtl = mtl::parse_mtl(&data).ok()?;
     mtl.source_path = Some(p4k_path.to_string());
+    populate_layer_snapshots(p4k, &mut mtl);
     Some(mtl)
+}
+
+fn populate_layer_snapshots(p4k: &MappedP4k, mtl: &mut mtl::MtlFile) {
+    for material in &mut mtl.materials {
+        let parent_surface_type = material.surface_type.clone();
+        for layer in &mut material.layers {
+            if layer.snapshot.is_none() || layer.resolved_material.is_none() {
+                if let Some((snapshot, resolved_material)) =
+                    load_layer_details(p4k, layer, &parent_surface_type)
+                {
+                    if layer.snapshot.is_none() {
+                        layer.snapshot = Some(snapshot);
+                    }
+                    if layer.resolved_material.is_none() {
+                        layer.resolved_material = Some(resolved_material);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn load_layer_details(
+    p4k: &MappedP4k,
+    layer: &mtl::MatLayer,
+    parent_surface_type: &str,
+) -> Option<(mtl::MatLayerSnapshot, mtl::ResolvedLayerMaterial)> {
+    let p4k_path = datacore_path_to_p4k(&layer.path);
+    let entry = p4k.entry_case_insensitive(&p4k_path)?;
+    let data = p4k.read(entry).ok()?;
+    let layer_mtl = mtl::parse_mtl(&data).ok()?;
+    let material = mtl::resolve_layer_submaterial(&layer_mtl, &layer.sub_material)?;
+
+    // Prefer the parent submaterial's SurfaceType (e.g. the hard-surface
+    // material carries ``metal_dense`` / ``rubber_dense`` etc. and
+    // expresses the intended PBR class). Layer sub-mtls sometimes
+    // declare their own SurfaceType that reflects the *sampling*
+    // material rather than the parent's intent (e.g. a rubber panel
+    // whose "Primary" layer is ``ship_lf_panel_rubber_a_base.mtl`` with
+    // SurfaceType=metal_shell). Trusting the parent avoids false
+    // metallic classifications in that case, while still falling back
+    // to the layer's SurfaceType when the parent is unset.
+    let effective_surface_type = if !parent_surface_type.is_empty() {
+        parent_surface_type
+    } else {
+        material.surface_type.as_str()
+    };
+
+    let specular_texture_mean = if material.public_param_f32(&["TintMode"]).unwrap_or(0.0) > 0.0 {
+        load_layer_specular_texture_mean(p4k, material)
+    } else {
+        None
+    };
+
+    Some((
+        mtl::MatLayerSnapshot {
+            shader: material.shader.clone(),
+            diffuse: material.diffuse,
+            specular: material.specular,
+            shininess: material.shininess,
+            wear_specular_color: material.public_param_rgb(&["WearSpecularColor"]),
+            wear_glossiness: material.public_param_f32(&["WearGlossiness"]),
+            surface_type: if effective_surface_type.is_empty() {
+                None
+            } else {
+                Some(effective_surface_type.to_string())
+            },
+            metallic: mtl::layer_metallic(
+                material.diffuse,
+                material.specular,
+                specular_texture_mean,
+            ),
+        },
+        material.resolved_layer_material(),
+    ))
+}
+
+fn load_layer_specular_texture_mean(p4k: &MappedP4k, material: &mtl::SubMaterial) -> Option<f32> {
+    if material.shader_family() != mtl::ShaderFamily::Layer {
+        return None;
+    }
+
+    // Layer sub-materials conventionally place their authored F0 texture in
+    // TexSlot6. Sampling a lower mip is sufficient for classification and much
+    // cheaper than decoding the full-resolution DDS.
+    let spec_path = material
+        .texture_slots
+        .iter()
+        .find(|binding| !binding.is_virtual && binding.slot.eq_ignore_ascii_case("TexSlot6"))
+        .map(|binding| binding.path.as_str())?;
+
+    let png = load_diffuse_texture(p4k, spec_path, 5)?;
+    let image = decode_png(&png)?;
+    let pixel_count = (image.width() as u64).saturating_mul(image.height() as u64);
+    if pixel_count == 0 {
+        return None;
+    }
+
+    let rgb_sum: u64 = image
+        .pixels()
+        .map(|pixel| u64::from(pixel[0]) + u64::from(pixel[1]) + u64::from(pixel[2]))
+        .sum();
+    Some(rgb_sum as f32 / (pixel_count as f32 * 255.0 * 3.0))
 }
 
 /// Convert a DataCore file path to P4k format.
@@ -1958,7 +4663,118 @@ fn transform_mesh_by_bone(mesh: &mut crate::Mesh, bone: &crate::skeleton::Bone) 
     mesh.model_max = new_max.into();
 }
 
-fn datacore_path_to_p4k(path: &str) -> String {
+fn rebase_mesh_submeshes_to_bone_space(
+    mesh: &mut crate::Mesh,
+    bones: &[crate::skeleton::Bone],
+) -> bool {
+    if mesh.submeshes.is_empty() || bones.is_empty() {
+        return false;
+    }
+
+    let source_positions = mesh.positions.clone();
+    let source_uvs = mesh.uvs.clone();
+    let source_secondary_uvs = mesh.secondary_uvs.clone();
+    let source_normals = mesh.normals.clone();
+    let source_tangents = mesh.tangents.clone();
+    let source_colors = mesh.colors.clone();
+    let source_indices = mesh.indices.clone();
+    let source_submeshes = mesh.submeshes.clone();
+
+    let mut rebuilt_positions: Vec<[f32; 3]> = Vec::new();
+    let mut rebuilt_uvs = source_uvs.as_ref().map(|_| Vec::new());
+    let mut rebuilt_secondary_uvs = source_secondary_uvs.as_ref().map(|_| Vec::new());
+    let mut rebuilt_normals = source_normals.as_ref().map(|_| Vec::new());
+    let mut rebuilt_tangents = source_tangents.as_ref().map(|_| Vec::new());
+    let mut rebuilt_colors = source_colors.as_ref().map(|_| Vec::new());
+    let mut rebuilt_indices = Vec::new();
+    let mut rebuilt_submeshes = Vec::with_capacity(source_submeshes.len());
+
+    for submesh in &source_submeshes {
+        let bone_index = submesh.node_parent_index as usize;
+        if bone_index >= bones.len() {
+            return false;
+        }
+
+        let bone = &bones[bone_index];
+        let bone_inverse = bone_world_transform(bone).inverse();
+        let [qw, qx, qy, qz] = bone.world_rotation;
+        let inv_rot = glam::Quat::from_xyzw(qx, qy, qz, qw).inverse();
+
+        let start = submesh.first_index as usize;
+        let end = (start + submesh.num_indices as usize).min(source_indices.len());
+        let mut remap = std::collections::BTreeMap::<u32, u32>::new();
+        let first_vertex = rebuilt_positions.len() as u32;
+        let first_index = rebuilt_indices.len() as u32;
+
+        for source_index in &source_indices[start..end] {
+            let rebuilt_index = if let Some(existing) = remap.get(source_index) {
+                *existing
+            } else {
+                let source_vertex = *source_index as usize;
+                if source_vertex >= source_positions.len() {
+                    return false;
+                }
+                let transformed = bone_inverse.transform_point3(glam::Vec3::from(source_positions[source_vertex]));
+                let new_index = rebuilt_positions.len() as u32;
+                rebuilt_positions.push(transformed.into());
+
+                if let (Some(source), Some(target)) = (&source_uvs, rebuilt_uvs.as_mut()) {
+                    target.push(source[source_vertex]);
+                }
+                if let (Some(source), Some(target)) = (&source_secondary_uvs, rebuilt_secondary_uvs.as_mut()) {
+                    target.push(source[source_vertex]);
+                }
+                if let (Some(source), Some(target)) = (&source_normals, rebuilt_normals.as_mut()) {
+                    target.push((inv_rot * glam::Vec3::from(source[source_vertex])).into());
+                }
+                if let (Some(source), Some(target)) = (&source_tangents, rebuilt_tangents.as_mut()) {
+                    let tangent = source[source_vertex];
+                    let rotated = inv_rot * glam::Vec3::new(tangent[0], tangent[1], tangent[2]);
+                    target.push([rotated.x, rotated.y, rotated.z, tangent[3]]);
+                }
+                if let (Some(source), Some(target)) = (&source_colors, rebuilt_colors.as_mut()) {
+                    target.push(source[source_vertex]);
+                }
+
+                remap.insert(*source_index, new_index);
+                new_index
+            };
+            rebuilt_indices.push(rebuilt_index);
+        }
+
+        let mut rebuilt_submesh = submesh.clone();
+        rebuilt_submesh.first_vertex = first_vertex;
+        rebuilt_submesh.num_vertices = rebuilt_positions.len() as u32 - first_vertex;
+        rebuilt_submesh.first_index = first_index;
+        rebuilt_submesh.num_indices = rebuilt_indices.len() as u32 - first_index;
+        rebuilt_submeshes.push(rebuilt_submesh);
+    }
+
+    let mut new_min = [f32::MAX; 3];
+    let mut new_max = [f32::MIN; 3];
+    for position in &rebuilt_positions {
+        for axis in 0..3 {
+            new_min[axis] = new_min[axis].min(position[axis]);
+            new_max[axis] = new_max[axis].max(position[axis]);
+        }
+    }
+
+    mesh.positions = rebuilt_positions;
+    mesh.uvs = rebuilt_uvs;
+    mesh.secondary_uvs = rebuilt_secondary_uvs;
+    mesh.normals = rebuilt_normals;
+    mesh.tangents = rebuilt_tangents;
+    mesh.colors = rebuilt_colors;
+    mesh.indices = rebuilt_indices;
+    mesh.submeshes = rebuilt_submeshes;
+    if !mesh.positions.is_empty() {
+        mesh.model_min = new_min;
+        mesh.model_max = new_max;
+    }
+    true
+}
+
+pub(crate) fn datacore_path_to_p4k(path: &str) -> String {
     // Some DataCore paths already include a "Data/" prefix — strip it to avoid "Data\Data\".
     let clean = path
         .strip_prefix("Data/")
@@ -2455,7 +5271,17 @@ fn load_single_mesh(
     } else {
         mtl_file
             .as_ref()
-            .map(|mtl| load_material_textures(p4k, mtl, opts.texture_mip, png_cache, opts.material_mode.include_normals(), opts.material_mode.experimental()))
+            .map(|mtl| {
+                load_material_textures(
+                    p4k,
+                    mtl,
+                    None,
+                    opts.texture_mip,
+                    png_cache,
+                    opts.material_mode.include_normals(),
+                    opts.material_mode.experimental(),
+                )
+            })
     };
 
     let mesh = crate::parse_skin_with_options(&mesh_bytes, use_model_bbox)?;
@@ -2476,6 +5302,8 @@ pub fn socpaks_to_glb(
 ) -> Result<Vec<u8>, Error> {
     use crate::socpak;
 
+    ensure_supported_export_options(opts)?;
+
     let identity: [[f32; 4]; 4] = [
         [1.0, 0.0, 0.0, 0.0],
         [0.0, 1.0, 0.0, 0.0],
@@ -2491,14 +5319,18 @@ pub fn socpaks_to_glb(
         }
     }
 
-    let interiors = build_interiors_from_payloads(db, &payloads, opts.include_lights);
+    let interiors = build_interiors_from_payloads(db, p4k, &payloads, opts.include_lights);
 
     let no_tex_opts = ExportOptions {
         material_mode: MaterialMode::Colors,
         ..opts.clone()
     };
-    let mut no_tex: Box<dyn FnMut(Option<&crate::mtl::MtlFile>) -> Option<MaterialTextures>> =
-        Box::new(|_| None);
+    let mut no_tex: Box<
+        dyn FnMut(
+            Option<&crate::mtl::MtlFile>,
+            Option<&crate::mtl::TintPalette>,
+        ) -> Option<MaterialTextures>,
+    > = Box::new(|_, _| None);
     let mut interior_png_cache = PngCache::new();
     let mut interior_mesh_loader =
         |entry: &InteriorCgfEntry| -> Option<(crate::Mesh, Option<mtl::MtlFile>, Option<crate::nmc::NodeMeshCombo>)> {
@@ -2510,7 +5342,7 @@ pub fn socpaks_to_glb(
                 &mut interior_png_cache,
                 false,
             ) {
-                Ok((mesh, mtl, _tex, nmc, _palette, _, _, _bones)) => {
+                Ok((mesh, mtl, _tex, nmc, _palette, _, _, _bones, _skeleton_source_path)) => {
                     let needs_bake = mesh.scaling_min.iter().zip(&mesh.model_min)
                         .chain(mesh.scaling_max.iter().zip(&mesh.model_max))
                         .any(|(s, m)| (s - m).abs() > 0.01);
@@ -2545,11 +5377,13 @@ pub fn socpaks_to_glb(
         },
         &crate::gltf::GlbOptions {
             material_mode: opts.material_mode,
+            preserve_textureless_decal_primitives: false,
             metadata: crate::gltf::GlbMetadata {
                 entity_name: None,
                 geometry_path: None,
                 material_path: None,
                 export_options: crate::gltf::ExportOptionsMetadata {
+                    kind: format!("{:?}", opts.kind),
                     material_mode: format!("{:?}", opts.material_mode),
                     format: format!("{:?}", opts.format),
                     lod_level: opts.lod_level,
@@ -2707,8 +5541,8 @@ pub fn dump_hierarchy(
             "    {{\n      \"container\": {:?},\n      \"meshes\": [\n",
             container.name
         );
-        for &(cgf_idx, ref transform) in &container.placements {
-            let entry = &interiors.unique_cgfs[cgf_idx];
+        for (cgf_idx, transform, _placement_palette) in &container.placements {
+            let entry = &interiors.unique_cgfs[*cgf_idx];
             let tx = transform[3][0];
             let ty = transform[3][1];
             let tz = transform[3][2];
@@ -2750,6 +5584,285 @@ pub fn dump_hierarchy(
 mod tests {
     use super::*;
 
+    use starbreaker_datacore::types::{CigGuid, StringId, StringId2};
+
+    fn sample_export_result(kind: ExportKind, glb: Vec<u8>) -> ExportResult {
+        ExportResult {
+            kind,
+            format: ExportFormat::Glb,
+            glb,
+            decomposed: None,
+            geometry_path: "objects/test.skin".to_string(),
+            material_path: "objects/test.mtl".to_string(),
+        }
+    }
+
+    fn dummy_record() -> starbreaker_datacore::types::Record {
+        starbreaker_datacore::types::Record {
+            name_offset: StringId2(-1),
+            file_name_offset: StringId(0),
+            tag_offset: StringId2(-1),
+            struct_index: 0,
+            id: CigGuid::EMPTY,
+            instance_index: 0,
+            struct_size: 0,
+        }
+    }
+
+    fn resolved_node(
+        entity_name: &str,
+        attachment_name: &str,
+        has_geometry: bool,
+        with_nmc: bool,
+        children: Vec<crate::types::ResolvedNode>,
+    ) -> crate::types::ResolvedNode {
+        crate::types::ResolvedNode {
+            entity_name: entity_name.to_string(),
+            attachment_name: attachment_name.to_string(),
+            no_rotation: false,
+            offset_position: [0.0; 3],
+            offset_rotation: [0.0; 3],
+            detach_direction: [0.0; 3],
+            port_flags: String::new(),
+            nmc: with_nmc.then_some(crate::nmc::NodeMeshCombo {
+                nodes: Vec::new(),
+                material_indices: Vec::new(),
+            }),
+            bones: Vec::new(),
+            has_geometry,
+            record: dummy_record(),
+            geometry_path: has_geometry.then(|| format!("Data/Objects/{entity_name}.skin")),
+            material_path: has_geometry.then(|| format!("Data/Objects/{entity_name}.mtl")),
+            children,
+        }
+    }
+
+    fn sample_mesh(node_parent_indices: &[u16]) -> crate::types::Mesh {
+        let submeshes = node_parent_indices
+            .iter()
+            .enumerate()
+            .map(|(index, node_parent_index)| crate::types::SubMesh {
+                material_name: None,
+                material_id: index as u32,
+                first_index: (index as u32) * 3,
+                num_indices: 3,
+                first_vertex: (index as u32) * 3,
+                num_vertices: 3,
+                node_parent_index: *node_parent_index,
+            })
+            .collect();
+
+        crate::types::Mesh {
+            positions: vec![[0.0, 0.0, 0.0]; node_parent_indices.len() * 3],
+            indices: (0..(node_parent_indices.len() as u32 * 3)).collect(),
+            uvs: None,
+            secondary_uvs: None,
+            normals: None,
+            tangents: None,
+            colors: None,
+            submeshes,
+            model_min: [0.0; 3],
+            model_max: [0.0; 3],
+            scaling_min: [0.0; 3],
+            scaling_max: [0.0; 3],
+        }
+    }
+
+    fn sample_bone(
+        name: &str,
+        parent_index: Option<u16>,
+        local_position: [f32; 3],
+        world_position: [f32; 3],
+    ) -> crate::skeleton::Bone {
+        crate::skeleton::Bone {
+            name: name.to_string(),
+            parent_index,
+            object_node_index: None,
+            local_position,
+            local_rotation: [1.0, 0.0, 0.0, 0.0],
+            world_position,
+            world_rotation: [1.0, 0.0, 0.0, 0.0],
+        }
+    }
+
+    #[test]
+    fn export_options_default_to_bundled_kind() {
+        assert_eq!(ExportOptions::default().kind, ExportKind::Bundled);
+    }
+
+    #[test]
+    fn synthetic_skin_nmc_uses_root_relative_bone_transforms() {
+        let mesh = sample_mesh(&[0, 1]);
+        let bones = vec![
+            sample_bone("root", None, [2.0, 0.0, 0.0], [2.0, 0.0, 0.0]),
+            sample_bone("foot", Some(0), [1.5, 2.5, 0.0], [5.0, 4.0, 0.0]),
+        ];
+
+        let nmc = synthesize_nmc_from_bones(&mesh, &bones)
+            .expect("expected a synthetic node hierarchy");
+
+        assert_eq!(nmc.nodes.len(), 2);
+        assert_eq!(nmc.nodes[0].name, "root");
+        assert_eq!(nmc.nodes[1].name, "foot");
+        assert_eq!(nmc.nodes[1].parent_index, Some(0));
+        assert_eq!(nmc.nodes[0].bone_to_world[0][3], 0.0);
+        assert_eq!(nmc.nodes[0].bone_to_world[1][3], 0.0);
+        assert_eq!(nmc.nodes[0].bone_to_world[2][3], 0.0);
+        assert_eq!(nmc.nodes[1].bone_to_world[0][3], 1.5);
+        assert_eq!(nmc.nodes[1].bone_to_world[1][3], 2.5);
+        assert_eq!(nmc.nodes[1].bone_to_world[2][3], 0.0);
+    }
+
+    #[test]
+    fn synthetic_skin_rebases_rigid_submesh_vertices_to_bone_space() {
+        let mut mesh = crate::types::Mesh {
+            positions: vec![
+                [2.0, 0.0, 0.0],
+                [3.0, 0.0, 0.0],
+                [2.0, 1.0, 0.0],
+                [5.0, 4.0, 0.0],
+                [6.0, 4.0, 0.0],
+                [5.0, 5.0, 0.0],
+            ],
+            indices: vec![0, 1, 2, 3, 4, 5],
+            uvs: None,
+            secondary_uvs: None,
+            normals: None,
+            tangents: None,
+            colors: None,
+            submeshes: vec![
+                crate::types::SubMesh {
+                    material_name: None,
+                    material_id: 0,
+                    first_index: 0,
+                    num_indices: 3,
+                    first_vertex: 0,
+                    num_vertices: 3,
+                    node_parent_index: 0,
+                },
+                crate::types::SubMesh {
+                    material_name: None,
+                    material_id: 1,
+                    first_index: 3,
+                    num_indices: 3,
+                    first_vertex: 3,
+                    num_vertices: 3,
+                    node_parent_index: 1,
+                },
+            ],
+            model_min: [2.0, 0.0, 0.0],
+            model_max: [6.0, 5.0, 0.0],
+            scaling_min: [2.0, 0.0, 0.0],
+            scaling_max: [6.0, 5.0, 0.0],
+        };
+        let bones = vec![
+            sample_bone("root", None, [2.0, 0.0, 0.0], [2.0, 0.0, 0.0]),
+            sample_bone("foot", Some(0), [3.0, 4.0, 0.0], [5.0, 4.0, 0.0]),
+        ];
+
+        assert!(rebase_mesh_submeshes_to_bone_space(&mut mesh, &bones));
+        assert_eq!(mesh.positions[0], [0.0, 0.0, 0.0]);
+        assert_eq!(mesh.positions[1], [1.0, 0.0, 0.0]);
+        assert_eq!(mesh.positions[2], [0.0, 1.0, 0.0]);
+        assert_eq!(mesh.positions[3], [0.0, 0.0, 0.0]);
+        assert_eq!(mesh.positions[4], [1.0, 0.0, 0.0]);
+        assert_eq!(mesh.positions[5], [0.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn synthetic_skin_nmc_skips_single_node_meshes() {
+        let mesh = sample_mesh(&[0, 0]);
+        let bones = vec![sample_bone("root", None, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0])];
+
+        assert!(synthesize_nmc_from_bones(&mesh, &bones).is_none());
+    }
+
+    #[test]
+    fn bundled_bytes_are_only_available_for_bundled_results() {
+        let bundled = sample_export_result(ExportKind::Bundled, vec![1, 2, 3]);
+        assert_eq!(bundled.bundled_bytes(), Some(&[1, 2, 3][..]));
+
+        let decomposed = sample_export_result(ExportKind::Decomposed, vec![1, 2, 3]);
+        assert_eq!(decomposed.bundled_bytes(), None);
+
+        let empty = sample_export_result(ExportKind::Bundled, Vec::new());
+        assert_eq!(empty.bundled_bytes(), None);
+    }
+
+    #[test]
+    fn collect_child_payload_specs_preserves_reparenting_and_helper_nodes() {
+        let proxy = resolved_node(
+            "proxy",
+            "hardpoint_proxy",
+            false,
+            false,
+            vec![resolved_node("weapon", "hardpoint_weapon", true, false, Vec::new())],
+        );
+        let rack = resolved_node(
+            "rack",
+            "hardpoint_rack",
+            false,
+            true,
+            vec![resolved_node("missile", "hardpoint_missile", true, false, Vec::new())],
+        );
+
+        let mut specs = Vec::new();
+        collect_child_payload_specs(&[proxy, rack], "root_ship", None, &mut specs);
+
+        assert_eq!(specs.len(), 3);
+        assert_eq!(specs[0].child.entity_name, "weapon");
+        assert_eq!(specs[0].parent_entity_name, "root_ship");
+        assert_eq!(specs[0].parent_node_name, "hardpoint_proxy");
+
+        assert_eq!(specs[1].child.entity_name, "rack");
+        assert_eq!(specs[1].parent_entity_name, "root_ship");
+        assert_eq!(specs[1].parent_node_name, "hardpoint_rack");
+
+        assert_eq!(specs[2].child.entity_name, "missile");
+        assert_eq!(specs[2].parent_entity_name, "rack");
+        assert_eq!(specs[2].parent_node_name, "hardpoint_missile");
+    }
+
+    #[test]
+    fn tint_palette_family_keys_include_short_name_and_family_suffix() {
+        let keys = tint_palette_family_keys("EntityClassDefinition.rsi_aurora_mk2");
+
+        assert_eq!(keys, vec!["aurora_mk2".to_string(), "rsi_aurora_mk2".to_string()]);
+    }
+
+    #[test]
+    fn tint_palette_family_matching_accepts_family_variants_only() {
+        let keys = tint_palette_family_keys("rsi_aurora_mk2");
+
+        assert!(tint_palette_matches_family("rsi_aurora_mk2", &keys));
+        assert!(tint_palette_matches_family("aurora_mk2_pink_green_purple", &keys));
+        assert!(!tint_palette_matches_family("rsi_interior_aurora_mk2_base", &keys));
+        assert!(!tint_palette_matches_family("misc_freelancer_black_red", &keys));
+    }
+
+    #[test]
+    fn export_kind_dispatch_accepts_decomposed_backend() {
+        let opts = ExportOptions {
+            kind: ExportKind::Decomposed,
+            ..ExportOptions::default()
+        };
+
+        ensure_supported_export_options(&opts)
+            .expect("decomposed export kind should be accepted");
+    }
+
+    #[test]
+    fn export_format_dispatch_rejects_stl_until_backend_exists() {
+        let opts = ExportOptions {
+            format: ExportFormat::Stl,
+            ..ExportOptions::default()
+        };
+
+        let err = ensure_supported_export_options(&opts)
+            .expect_err("stl export format should be rejected");
+        assert!(matches!(err, Error::UnsupportedExportFormat(format) if format == "Stl"));
+    }
+
     #[test]
     fn resolve_mtl_p4k_path_full_path() {
         assert_eq!(
@@ -2787,6 +5900,28 @@ mod tests {
         assert_eq!(
             datacore_path_to_p4k("a/b/c/d/e.cgf"),
             "Data\\a\\b\\c\\d\\e.cgf"
+        );
+    }
+
+    #[test]
+    fn skeleton_source_paths_include_direct_skin_geometry() {
+        assert_eq!(
+            skeleton_source_paths(None, "Data/Objects/Ships/Test/gear.skin"),
+            vec!["Data/Objects/Ships/Test/gear.skin"]
+        );
+    }
+
+    #[test]
+    fn skeleton_source_paths_prefer_explicit_skeleton_before_geometry() {
+        assert_eq!(
+            skeleton_source_paths(
+                Some("Data/Objects/Ships/Test/gear.chr"),
+                "Data/Objects/Ships/Test/gear.skin"
+            ),
+            vec![
+                "Data/Objects/Ships/Test/gear.chr",
+                "Data/Objects/Ships/Test/gear.skin",
+            ]
         );
     }
 }

@@ -1,4 +1,5 @@
 pub mod dequant;
+pub(crate) mod decomposed;
 pub mod error;
 pub(crate) mod gltf;
 pub(crate) mod included_objects;
@@ -9,12 +10,16 @@ pub(crate) mod pipeline;
 pub mod skeleton;
 pub(crate) mod socpak;
 pub mod types;
+pub mod animation;
+pub mod chrparams;
 
 pub use error::Error;
 pub use pipeline::{
-    ExportFormat, ExportOptions, ExportResult, MaterialMode,
-    assemble_glb_with_loadout,
-    dump_hierarchy, load_invisible_ports, resolve_loadout_meshes, socpaks_to_glb,
+    DecomposedExport, ExportFormat, ExportKind, ExportOptions, ExportResult, ExportedFile,
+    ExportedFileKind, MaterialMode,
+    assemble_glb_with_loadout, assemble_glb_with_loadout_with_progress,
+    dump_hierarchy, load_invisible_ports, query_animation_controller_source,
+    resolve_loadout_meshes, socpaks_to_glb,
 };
 pub use types::Mesh;
 
@@ -80,16 +85,18 @@ pub fn skin_to_glb(data: &[u8], metadata: Option<&[u8]>) -> Result<Vec<u8>, Erro
             interiors: pipeline::LoadedInteriors::default(),
         },
         &mut gltf::GlbLoaders {
-            load_textures: &mut |_| None,
+            load_textures: &mut |_, _| None,
             load_interior_mesh: &mut |_| None,
         },
         &gltf::GlbOptions {
             material_mode: pipeline::MaterialMode::None,
+            preserve_textureless_decal_primitives: false,
             metadata: gltf::GlbMetadata {
                 entity_name: None,
                 geometry_path: None,
                 material_path: None,
                 export_options: gltf::ExportOptionsMetadata {
+                    kind: "Bundled".to_string(),
                     material_mode: "None".to_string(),
                     format: "Glb".to_string(),
                     lod_level: 0,

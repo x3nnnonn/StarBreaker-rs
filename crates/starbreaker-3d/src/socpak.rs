@@ -13,7 +13,7 @@ use starbreaker_datacore::query::value::Value;
 use starbreaker_p4k::{MappedP4k, P4kArchive};
 
 use crate::error::Error;
-use crate::types::{InteriorMesh, InteriorPayload, LightInfo};
+use crate::types::{InteriorMesh, InteriorPayload, LightInfo, LightStateInfo};
 
 // ── DataCore query ──────────────────────────────────────────────────────────
 
@@ -532,12 +532,23 @@ fn parse_light_entities(
     vec![LightInfo {
         name: base_name,
         position: base_pos,
+        transform_basis: "cryengine_z_up".to_string(),
         rotation: base_rot,
+        direction_sc: [1.0, 0.0, 0.0],
         color: [1.0, 0.95, 0.9],
+        light_type: "Omni".to_string(),
+        semantic_light_kind: "point".to_string(),
+        intensity_raw: 1.0,
+        intensity_unit: "cryengine_authored_intensity".to_string(),
+        intensity_candela_proxy: 200.0,
         intensity: 200.0,
         radius,
+        radius_m: radius,
         inner_angle: None,
         outer_angle: None,
+        projector_texture: None,
+        active_state: String::new(),
+        states: std::collections::BTreeMap::new(),
     }]
 }
 
@@ -603,12 +614,14 @@ fn parse_light_group(
                 // per-light translation/rotation offsets relative to the group.
                 let (rel_translation, rel_rotation) =
                     extract_relative_xform(xml, light_node);
+                let rel_translation_world =
+                    quat_rotate_vec(base_rot, &rel_translation);
 
                 // Combine group position with per-light offset
                 let light_pos = [
-                    base_pos[0] + rel_translation[0],
-                    base_pos[1] + rel_translation[1],
-                    base_pos[2] + rel_translation[2],
+                    base_pos[0] + rel_translation_world[0],
+                    base_pos[1] + rel_translation_world[1],
+                    base_pos[2] + rel_translation_world[2],
                 ];
                 let light_rot = quat_mul(base_rot, &rel_rotation);
 
@@ -637,12 +650,23 @@ fn parse_light_group(
         lights.push(LightInfo {
             name: base_name.to_string(),
             position: *base_pos,
+            transform_basis: "cryengine_z_up".to_string(),
             rotation: *base_rot,
+            direction_sc: quat_rotate_vec(base_rot, &[1.0, 0.0, 0.0]),
             color: [1.0, 0.95, 0.9],
+            light_type: "Omni".to_string(),
+            semantic_light_kind: "point".to_string(),
+            intensity_raw: 1.0,
+            intensity_unit: "cryengine_authored_intensity".to_string(),
+            intensity_candela_proxy: 200.0,
             intensity: 200.0,
             radius: 5.0,
+            radius_m: 5.0,
             inner_angle: None,
             outer_angle: None,
+            projector_texture: None,
+            active_state: String::new(),
+            states: std::collections::BTreeMap::new(),
         });
     }
     lights
@@ -665,55 +689,160 @@ fn build_light_info_from_component(
     pos: &[f64; 3],
     rot: &[f64; 4],
 ) -> Option<LightInfo> {
-    // Collect all attributes recursively from the component subtree.
-    // CryEngine light data is spread across nested children with varying depth.
-    let all_attrs = collect_all_attrs_recursive(xml, component);
+    // The EntityComponentLight carries top-level fields (lightType,
+    // useTemperature, etc.) directly. State-specific values (intensity,
+    // temperature, and the <color r g b> child element) live on dedicated
+    // state children: offState / defaultState / auxiliaryState /
+    // emergencyState / cinematicState. Star Citizen renders the "default"
+    // state for baked-in lights, so we read from <defaultState> only.
+    let component_attrs: HashMap<&str, &str> = xml
+        .node_attributes(component)
+        .filter(|(k, _)| *k != "__type")
+        .collect();
 
-    log::debug!("  Light '{name}' all_attrs: {:?}", all_attrs);
-
-    let af = |key: &str| -> f32 {
-        all_attrs
-            .get(key)
-            .and_then(|s| s.parse::<f32>().ok())
-            .unwrap_or(0.0)
-    };
-
-    // Intensity
-    let intensity = af("intensity").max(0.001);
-
-    // Radius: lightRadius is the attenuation radius
-    let radius = {
-        let r = af("lightRadius");
-        if r > 0.0 { r } else { 5.0 }
-    };
-
-    // Color: separate r, g, b channels (0-1 range in CryEngine)
-    let use_temperature = all_attrs
+    let bool_truthy = |s: &str| matches!(s, "1" | "true" | "True" | "TRUE");
+    let use_temperature = component_attrs
         .get("useTemperature")
-        .map(|s| *s == "1")
+        .map(|s| bool_truthy(s))
         .unwrap_or(false);
-    let color = if use_temperature {
-        // Convert color temperature (Kelvin) to RGB using Tanner Helland's algorithm
-        let temp = af("temperature").max(1000.0).min(40000.0);
-        kelvin_to_rgb(temp)
-    } else {
-        let r = af("r").max(0.0).min(1.0);
-        let g = af("g").max(0.0).min(1.0);
-        let b = af("b").max(0.0).min(1.0);
-        if r == 0.0 && g == 0.0 && b == 0.0 {
-            [1.0, 0.95, 0.9] // fallback warm white
-        } else {
-            [r, g, b]
-        }
+    let light_type = component_attrs
+        .get("lightType")
+        .copied()
+        .unwrap_or("Omni")
+        .to_string();
+
+    // CryEngine light components expose several runtime states
+    // (`offState` / `defaultState` / `auxiliaryState` / `emergencyState` /
+    // `cinematicState`). Each carries its own intensity, temperature, and
+    // <color r g b> child. Collect every authored state so downstream
+    // tools can switch between them; then pick the first with
+    // intensity > 0 (in fallback order) as the active state to expose on
+    // the flat `color` / `intensity` fields.
+    const ALL_STATES: &[&str] = &[
+        "offState",
+        "defaultState",
+        "auxiliaryState",
+        "emergencyState",
+        "cinematicState",
+    ];
+    const STATE_PRIORITY: &[&str] = &[
+        "defaultState",
+        "auxiliaryState",
+        "emergencyState",
+        "cinematicState",
+    ];
+
+    let read_state = |tag: &str| -> Option<LightStateInfo> {
+        let node = xml
+            .node_children(component)
+            .find(|c| xml.node_tag(c) == tag)?;
+        let a: HashMap<&str, &str> = xml
+            .node_attributes(node)
+            .filter(|(k, _)| *k != "__type")
+            .collect();
+        let intensity_raw = a
+            .get("intensity")
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(0.0);
+        let temperature = a
+            .get("temperature")
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(6500.0);
+        let (cr, cg, cb) = xml
+            .node_children(node)
+            .find(|c| xml.node_tag(c) == "color")
+            .map(|c| {
+                let ca: HashMap<&str, &str> = xml
+                    .node_attributes(c)
+                    .filter(|(k, _)| *k != "__type")
+                    .collect();
+                let f = |k: &str| {
+                    ca.get(k)
+                        .and_then(|s| s.parse::<f32>().ok())
+                        .unwrap_or(1.0)
+                        .clamp(0.0, 1.0)
+                };
+                (f("r"), f("g"), f("b"))
+            })
+            .unwrap_or((1.0, 1.0, 1.0));
+        Some(LightStateInfo {
+            intensity_raw,
+            intensity_unit: "cryengine_authored_intensity".to_string(),
+            intensity_cd: intensity_raw * 200.0,
+            intensity_candela_proxy: intensity_raw * 200.0,
+            temperature,
+            use_temperature,
+            color: [cr, cg, cb],
+        })
     };
 
-    // Light type
-    let light_type = all_attrs.get("lightType").copied().unwrap_or("Omni");
+    let mut states: std::collections::BTreeMap<String, LightStateInfo> =
+        std::collections::BTreeMap::new();
+    for tag in ALL_STATES {
+        if let Some(s) = read_state(tag) {
+            states.insert((*tag).to_string(), s);
+        }
+    }
 
-    // Spot light parameters
-    let (inner_angle, outer_angle) = if light_type == "Projector" {
-        let fov = af("FOV").max(1.0);
-        // CryEngine FOV is full cone angle; glTF uses half-angles
+    // Pick the active state via priority order.
+    let active_state_name = STATE_PRIORITY
+        .iter()
+        .find(|tag| {
+            states
+                .get(**tag)
+                .map(|s| s.intensity_raw > 0.0)
+                .unwrap_or(false)
+        })
+        .copied()
+        .unwrap_or("");
+    let active = states.get(active_state_name);
+    let intensity_raw = active.map(|s| s.intensity_raw).unwrap_or(0.0);
+    let temperature = active.map(|s| s.temperature).unwrap_or(6500.0);
+    let (color_r, color_g, color_b) = active
+        .map(|s| (s.color[0], s.color[1], s.color[2]))
+        .unwrap_or((1.0, 1.0, 1.0));
+
+    let color = if use_temperature {
+        kelvin_to_rgb(temperature.clamp(1000.0, 40000.0))
+    } else {
+        [color_r, color_g, color_b]
+    };
+
+    // sizeParams > lightRadius (attenuation radius).
+    let radius = xml
+        .node_children(component)
+        .find(|c| xml.node_tag(c) == "sizeParams")
+        .and_then(|sp| {
+            xml.node_attributes(sp)
+                .find(|(k, _)| *k == "lightRadius")
+                .and_then(|(_, v)| v.parse::<f32>().ok())
+        })
+        .filter(|r| *r > 0.0)
+        .unwrap_or(5.0);
+
+    // projectorParams > texture, FOV
+    let (projector_texture, fov) = xml
+        .node_children(component)
+        .find(|c| xml.node_tag(c) == "projectorParams")
+        .map(|pp| {
+            let a: HashMap<&str, &str> = xml
+                .node_attributes(pp)
+                .filter(|(k, _)| *k != "__type")
+                .collect();
+            let tex = a
+                .get("texture")
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty());
+            let fov = a
+                .get("FOV")
+                .and_then(|s| s.parse::<f32>().ok())
+                .unwrap_or(0.0);
+            (tex, fov)
+        })
+        .unwrap_or((None, 0.0));
+
+    // Spot light half-angles
+    let (inner_angle, outer_angle) = if light_type == "Projector" && fov > 0.0 {
         let outer = fov * 0.5;
         let inner = outer * 0.8;
         (Some(inner), Some(outer))
@@ -721,26 +850,53 @@ fn build_light_info_from_component(
         (None, None)
     };
 
-    // CryEngine intensity to glTF candela:
-    // CryEngine intensity values are typically 1-20 for interior lights.
-    // glTF KHR_lights_punctual expects candela.
-    // Empirical mapping: candela ≈ intensity * 200 gives reasonable results.
-    let candela = intensity * 200.0;
+    // CryEngine intensity → glTF candela.
+    let candela = intensity_raw * 200.0;
+    let semantic_light_kind = semantic_light_kind_for_light(&light_type, inner_angle, outer_angle);
+    let direction_sc = quat_rotate_vec(rot, &[1.0, 0.0, 0.0]);
 
     log::debug!(
-        "  → type={light_type}, intensity={intensity}, candela={candela}, radius={radius}, color={color:?}"
+        "  Light '{name}' type={light_type} useTemp={use_temperature} \
+         temperature={temperature} intensity={intensity_raw} radius={radius} color={color:?}"
     );
 
     Some(LightInfo {
         name: name.to_string(),
         position: *pos,
+        transform_basis: "cryengine_z_up".to_string(),
         rotation: *rot,
+        direction_sc,
         color,
+        light_type,
+        semantic_light_kind: semantic_light_kind.to_string(),
+        intensity_raw,
+        intensity_unit: "cryengine_authored_intensity".to_string(),
+        intensity_candela_proxy: candela,
         intensity: candela,
         radius,
+        radius_m: radius,
         inner_angle,
         outer_angle,
+        projector_texture,
+        active_state: active_state_name.to_string(),
+        states,
     })
+}
+
+fn semantic_light_kind_for_light(
+    light_type: &str,
+    inner_angle: Option<f32>,
+    outer_angle: Option<f32>,
+) -> &'static str {
+    match light_type.to_ascii_lowercase().as_str() {
+        "directional" | "sun" => "sun",
+        "planar" | "area" => "area",
+        "projector" | "spot" => "spot",
+        "ambient" => "ambient_proxy",
+        "omni" | "softomni" | "point" => "point",
+        _ if inner_angle.unwrap_or(0.0) > 0.0 || outer_angle.unwrap_or(0.0) > 0.0 => "spot",
+        _ => "point",
+    }
 }
 
 /// Convert color temperature in Kelvin to linear sRGB [r, g, b] (0-1).
@@ -801,28 +957,6 @@ fn extract_relative_xform(
     ([0.0; 3], [1.0, 0.0, 0.0, 0.0])
 }
 
-/// Recursively collect all attributes from a CryXML node and its descendants.
-/// Skips `__type` attributes. Later values overwrite earlier ones on key collision.
-fn collect_all_attrs_recursive<'a>(
-    xml: &'a CryXml,
-    node: &'a starbreaker_cryxml::CryXmlNode,
-) -> HashMap<&'a str, &'a str> {
-    let mut attrs = HashMap::new();
-    for (k, v) in xml.node_attributes(node) {
-        if k != "__type" {
-            attrs.insert(k, v);
-        }
-    }
-    for child in xml.node_children(node) {
-        for (k, v) in collect_all_attrs_recursive(xml, child) {
-            if k != "__type" {
-                attrs.insert(k, v);
-            }
-        }
-    }
-    attrs
-}
-
 // ── Math helpers ────────────────────────────────────────────────────────────
 
 /// Multiply two quaternions [w, x, y, z].
@@ -835,6 +969,12 @@ fn quat_mul(a: &[f64; 4], b: &[f64; 4]) -> [f64; 4] {
         aw * by - ax * bz + ay * bw + az * bx,
         aw * bz + ax * by - ay * bx + az * bw,
     ]
+}
+
+fn quat_rotate_vec(rotation: &[f64; 4], vector: &[f64; 3]) -> [f64; 3] {
+    let quat = glam::DQuat::from_xyzw(rotation[1], rotation[2], rotation[3], rotation[0]);
+    let rotated = quat * glam::DVec3::new(vector[0], vector[1], vector[2]);
+    [rotated.x, rotated.y, rotated.z]
 }
 
 fn parse_csv_f64(s: &str) -> Vec<f64> {
@@ -881,4 +1021,53 @@ pub fn build_container_transform(pos: [f32; 3], rot_deg: [f32; 3]) -> [[f32; 4];
         [cx * sy * cz + sx * sz, cx * sy * sz - sx * cz, cx * cy, 0.0],
         [pos[0], pos[1], pos[2], 1.0],
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{quat_mul, quat_rotate_vec, semantic_light_kind_for_light};
+
+    fn approx_eq3(left: [f64; 3], right: [f64; 3]) {
+        for index in 0..3 {
+            assert!(
+                (left[index] - right[index]).abs() < 1e-9,
+                "component {} mismatch: left={} right={}",
+                index,
+                left[index],
+                right[index]
+            );
+        }
+    }
+
+    #[test]
+    fn light_group_relative_translation_respects_group_rotation() {
+        let half_turn = std::f64::consts::FRAC_1_SQRT_2;
+        let base_rotation = [half_turn, 0.0, 0.0, half_turn];
+        let rel_translation = [5.0, 0.0, 0.0];
+        let rotated = quat_rotate_vec(&base_rotation, &rel_translation);
+
+        approx_eq3(rotated, [0.0, 5.0, 0.0]);
+    }
+
+    #[test]
+    fn light_group_relative_rotation_still_composes_after_translation_fix() {
+        let half_turn = std::f64::consts::FRAC_1_SQRT_2;
+        let base_rotation = [half_turn, 0.0, 0.0, half_turn];
+        let rel_rotation = [half_turn, half_turn, 0.0, 0.0];
+
+        let combined = quat_mul(&base_rotation, &rel_rotation);
+
+        approx_eq3([combined[1], combined[2], combined[3]], [0.5, 0.5, 0.5]);
+        assert!((combined[0] - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn semantic_light_kind_maps_planar_to_area() {
+        assert_eq!(semantic_light_kind_for_light("Planar", None, None), "area");
+    }
+
+    #[test]
+    fn semantic_light_kind_maps_unknown_angled_light_to_spot() {
+        assert_eq!(semantic_light_kind_for_light("Unknown", Some(1.0), Some(2.0)), "spot");
+    }
 }

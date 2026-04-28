@@ -34,6 +34,9 @@ pub fn load_dcb_bytes(
 /// Shared glTF export options.
 #[derive(clap::Args, Debug)]
 pub struct ExportOpts {
+    /// Export kind: bundled or decomposed
+    #[arg(long, default_value = "bundled")]
+    pub kind: String,
     /// Material detail: none, colors, textures, all
     #[arg(long, default_value = "textures")]
     pub materials: String,
@@ -55,10 +58,23 @@ pub struct ExportOpts {
     /// Skip lights from interior containers
     #[arg(long)]
     pub no_lights: bool,
+    /// Skip writing existing decomposed mesh and texture assets under Data/
+    #[arg(long)]
+    pub skip_existing_assets: bool,
+    /// Include NoDraw faces and sidecar entries in decomposed exports
+    #[arg(long)]
+    pub include_nodraw: bool,
+    /// Include shield helper meshes and shield attachments in exports
+    #[arg(long)]
+    pub include_shields: bool,
 }
 
 impl From<&ExportOpts> for starbreaker_3d::ExportOptions {
     fn from(opts: &ExportOpts) -> Self {
+        let kind = match opts.kind.to_lowercase().as_str() {
+            "decomposed" => starbreaker_3d::ExportKind::Decomposed,
+            _ => starbreaker_3d::ExportKind::Bundled,
+        };
         let material_mode = match opts.materials.to_lowercase().as_str() {
             "none" => starbreaker_3d::MaterialMode::None,
             "colors" => starbreaker_3d::MaterialMode::Colors,
@@ -74,13 +90,19 @@ impl From<&ExportOpts> for starbreaker_3d::ExportOptions {
             _ => starbreaker_3d::ExportFormat::Glb,
         };
         starbreaker_3d::ExportOptions {
+            kind,
             format,
             material_mode,
             include_attachments: !opts.no_attachments,
             include_interior: !opts.no_interior,
             include_lights: !opts.no_lights,
+            include_nodraw: opts.include_nodraw,
+            include_shields: opts.include_shields,
             texture_mip: opts.mip,
             lod_level: opts.lod,
+            include_animations: matches!(kind, starbreaker_3d::ExportKind::Decomposed),
+            apply_default_animation_pose: !matches!(kind, starbreaker_3d::ExportKind::Decomposed),
+            default_animation_tags: vec!["landing_gear_extend".to_string()],
         }
     }
 }

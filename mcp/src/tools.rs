@@ -104,6 +104,28 @@ pub struct MtlSummaryRequest {
     pub path: String,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct DbaDumpRequest {
+    #[schemars(description = "Path to a .dba or .caf file in P4k (case-insensitive, Data\\ prefix optional). May also be an absolute filesystem path.")]
+    pub path: String,
+    #[schemars(description = "Optional path to a rig source used to resolve bone hashes to names. Accepts either a .chr / .skin / .skinm skeleton (CompiledBones chunk) OR a .cga / .cgam scene-graph file (NMC chunk — used by ships like the Scorpius whose main body has no CHR). Same path resolution as 'path'. Required for bone_filter to work.")]
+    pub skeleton: Option<String>,
+    #[schemars(description = "Filter CLIPS by case-insensitive substring match on the clip metadata name (e.g. 'wings_deploy'). Independent of bone_filter.")]
+    pub filter: Option<String>,
+    #[schemars(description = "Filter CHANNELS by case-insensitive substring match on the resolved bone name (e.g. 'Wing_Mechanism'). Requires `skeleton` to be set; channels with unresolved hashes are excluded when this is active.")]
+    pub bone_filter: Option<String>,
+    #[schemars(description = "If true, include every keyframe per channel; otherwise only first/last samples are included. Default false.")]
+    pub all_keyframes: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct MannequinDumpRequest {
+    #[schemars(description = "Entity name (substring match, uses shortest match) used to resolve the entity's SAnimationControllerParams.AnimationDatabase and AnimationController paths.")]
+    pub entity: String,
+    #[schemars(description = "Optional case-insensitive substring filter against fragment group name, GUID, or animation name.")]
+    pub filter: Option<String>,
+}
+
 
 pub struct StarBreakerMcp {
     p4k_path: Option<std::path::PathBuf>,
@@ -198,6 +220,17 @@ impl StarBreakerMcp {
                     .and_then(|entry| self.p4k().read(entry).map_err(|e| format!("Error reading: {e}")))
             })
             .map_err(|e| format!("{e}"))
+    }
+
+    /// Read a file either from disk (if the path exists on disk) or
+    /// from P4k. Used by debug tools that may receive either an
+    /// extracted scratch file or a P4k-internal path.
+    fn read_p4k_or_disk(&self, path: &str) -> Result<Vec<u8>, String> {
+        let direct = std::path::Path::new(path);
+        if direct.is_file() {
+            return std::fs::read(direct).map_err(|e| format!("disk read failed: {e}"));
+        }
+        self.read_p4k_file(path)
     }
 
     /// Find any record by GUID or name substring.
@@ -777,6 +810,82 @@ impl StarBreakerMcp {
         }
 
         out
+    }
+
+    #[tool(description = "Inspect a CryEngine animation database (.dba) or compressed animation file (.caf). Returns structured JSON: clip metadata (name, fps, frame_count, channel_count) and per-channel bone hashes plus first/last keyframe samples (or full keyframe arrays with all_keyframes=true). Provide `skeleton` to resolve bone hashes to names — accepts either a CHR skeleton (CompiledBones) or a CGA/CGAM scene graph (NMC nodes) for ships whose main body has no CHR; combine with `bone_filter` to drill down to a small set of channels (e.g. wings, landing gear). Use `filter` for clip-name filtering. Replaces the legacy `starbreaker dba dump` CLI.")]
+    fn dba_dump(&self, Parameters(req): Parameters<DbaDumpRequest>) -> String {
+        let bytes = match self.read_p4k_or_disk(&req.path) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
+        let db = if req.path.to_ascii_lowercase().ends_with(".caf") {
+            match starbreaker_3d::animation::parse_caf(&bytes) {
+                Ok(db) => db,
+                Err(e) => return format!("parse_caf failed for {}: {e}", req.path),
+            }
+        } else {
+            match starbreaker_3d::animation::parse_dba(&bytes) {
+                Ok(db) => db,
+                Err(e) => return format!("parse_dba failed for {}: {e}", req.path),
+            }
+        };
+        let mut hash_to_name: std::collections::HashMap<u32, String> =
+            std::collections::HashMap::new();
+        if let Some(skel_path) = req.skeleton.as_ref() {
+            match self.read_p4k_or_disk(skel_path) {
+                Ok(sb) => {
+                    if let Some(names) = starbreaker_3d::skeleton::parse_rig_node_names(&sb) {
+                        for name in &names {
+                            hash_to_name.insert(
+                                starbreaker_3d::animation::bone_name_hash(name),
+                                name.clone(),
+                            );
+                        }
+                    } else {
+                        return format!(
+                            "Skeleton '{skel_path}' has no CompiledBones (CHR) or NMC (CGA/CGAM) chunk; cannot resolve bone names"
+                        );
+                    }
+                }
+                Err(e) => return format!("Failed to read skeleton '{skel_path}': {e}"),
+            }
+        }
+        let value = starbreaker_3d::animation::dump_database_to_json(
+            &db,
+            &hash_to_name,
+            req.filter.as_deref(),
+            req.bone_filter.as_deref(),
+            req.all_keyframes.unwrap_or(false),
+        );
+        match serde_json::to_string_pretty(&value) {
+            Ok(s) => s,
+            Err(e) => format!("serialize failed: {e}"),
+        }
+    }
+
+    #[tool(description = "Dump the Mannequin Animation Database (ADB) plus its companion ControllerDef for an entity. Returns structured JSON listing every Mannequin Fragment with group name, GUID, tags, FragTags, BlendOutDuration, OptionWeight, animations, scopes (resolved from the ControllerDef), and procedurals. Use to inspect fragment-scope metadata for animation troubleshooting (Phase 37). Note: the ADB has no per-bone blend-mode flag; use dba_dump's `rot_format_flags`/`pos_format_flags` for per-bone CAF metadata.")]
+    fn mannequin_dump(&self, Parameters(req): Parameters<MannequinDumpRequest>) -> String {
+        let db = self.db();
+        let record = match self.find_entity(&db, &req.entity) {
+            Some(r) => r,
+            None => return format!("No entity matching '{}'", req.entity),
+        };
+        let source = match starbreaker_3d::query_animation_controller_source(&db, record) {
+            Some(s) => s,
+            None => return format!("Entity '{}' has no SAnimationControllerParams", req.entity),
+        };
+        let value = match starbreaker_3d::animation::dump_mannequin_adb_to_json(
+            self.p4k(),
+            &source,
+            req.filter.as_deref(),
+        ) {
+            Ok(v) => v,
+            Err(e) => return format!("dump_mannequin_adb_to_json failed: {e}"),
+        };
+        match serde_json::to_string_pretty(&value) {
+            Ok(s) => s,
+            Err(e) => format!("serialize failed: {e}"),
+        }
     }
 
 }

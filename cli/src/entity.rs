@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use clap::Subcommand;
 use starbreaker_datacore::database::Database;
@@ -8,13 +9,155 @@ use starbreaker_datacore::types::Record;
 use crate::common::{ExportOpts, load_dcb_bytes};
 use crate::error::{CliError, Result};
 
+fn bundled_extension(format: starbreaker_3d::ExportFormat) -> &'static str {
+    match format {
+        starbreaker_3d::ExportFormat::Glb => "glb",
+        starbreaker_3d::ExportFormat::Stl => "stl",
+    }
+}
+
+fn export_entity_name(name: &str) -> String {
+    let trimmed = name.trim_matches('"');
+    trimmed
+        .rsplit('.')
+        .next()
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
+fn sanitize_export_name(name: &str) -> String {
+    let mut cleaned = String::new();
+    let mut last_was_space = false;
+
+    for ch in name.chars() {
+        if ch.is_alphanumeric() {
+            cleaned.push(ch);
+            last_was_space = false;
+        } else if ch.is_whitespace() || matches!(ch, '_' | '-') {
+            if !cleaned.is_empty() && !last_was_space {
+                cleaned.push(' ');
+                last_was_space = true;
+            }
+        }
+    }
+
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        "Export".to_string()
+    } else {
+        cleaned.to_string()
+    }
+}
+
+fn prepare_decomposed_output_root(output_root: &PathBuf, package_name: &str) -> Result<()> {
+    if output_root.exists() {
+        if output_root.is_file() {
+            return Err(CliError::InvalidInput(format!(
+                "decomposed output root '{}' already exists as a file",
+                output_root.display(),
+            )));
+        }
+    }
+
+    let packages_root = output_root.join("Packages");
+    let package_root = packages_root.join(package_name);
+    if package_root.exists() {
+        std::fs::remove_dir_all(&package_root)
+            .map_err(|e| CliError::IoPath { source: e, path: package_root.display().to_string() })?;
+    }
+
+    std::fs::create_dir_all(&package_root)
+        .map_err(|e| CliError::IoPath { source: e, path: package_root.display().to_string() })?;
+    Ok(())
+}
+
+fn should_skip_existing_decomposed_asset(
+    file: &starbreaker_3d::ExportedFile,
+    skip_existing_assets: bool,
+) -> bool {
+    skip_existing_assets && file.kind.is_mesh_or_texture_asset()
+}
+
+fn write_decomposed_file(
+    file: &starbreaker_3d::ExportedFile,
+    output_path: &PathBuf,
+    skip_existing_assets: bool,
+) -> Result<()> {
+    if output_path.exists() {
+        if !output_path.is_file() {
+            return Err(CliError::InvalidInput(format!(
+                "decomposed output path '{}' already exists as a directory",
+                output_path.display(),
+            )));
+        }
+        if should_skip_existing_decomposed_asset(file, skip_existing_assets) {
+            return Ok(());
+        }
+    }
+
+    std::fs::write(output_path, &file.bytes)
+        .map_err(|e| CliError::IoPath { source: e, path: output_path.display().to_string() })?;
+    Ok(())
+}
+
+fn collect_existing_decomposed_assets(output_root: &Path) -> Result<HashSet<String>> {
+    let data_root = output_root.join("Data");
+    let mut existing = HashSet::new();
+    if !data_root.exists() {
+        return Ok(existing);
+    }
+
+    let mut pending = vec![data_root];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir)
+            .map_err(|e| CliError::IoPath { source: e, path: dir.display().to_string() })?
+        {
+            let entry = entry
+                .map_err(|e| CliError::IoPath { source: e, path: dir.display().to_string() })?;
+            let path = entry.path();
+            let file_type = entry
+                .file_type()
+                .map_err(|e| CliError::IoPath { source: e, path: path.display().to_string() })?;
+            if file_type.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+
+            let Some(extension) = path.extension().and_then(|ext| ext.to_str()) else {
+                continue;
+            };
+            if !matches!(extension, "glb" | "png") {
+                continue;
+            }
+
+            let relative = path
+                .strip_prefix(output_root)
+                .map_err(|_| {
+                    CliError::InvalidInput(format!(
+                        "failed to compute relative decomposed asset path for '{}'",
+                        path.display(),
+                    ))
+                })?
+                .to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_lowercase();
+            existing.insert(relative);
+        }
+    }
+
+    Ok(existing)
+}
+
 #[derive(Subcommand)]
 pub enum EntityCommand {
-    /// Export entity to GLB
+    /// Export entity to a bundled file
     Export {
         /// Entity name (substring, case-insensitive)
         name: String,
-        /// Output .glb path
+        /// Output bundled file path
         output: Option<PathBuf>,
         /// Path to Data.p4k
         #[arg(long, env = "SC_DATA_P4K")]
@@ -88,13 +231,28 @@ fn export(
 
     let record = candidates[0];
     let rname = db.resolve_string2(record.name_offset);
+    let export_name = sanitize_export_name(&export_entity_name(rname));
     if candidates.len() > 1 {
         eprintln!("Found {} candidates, using shortest match: {rname}", candidates.len());
     }
 
     let idx = EntityIndex::new(&db);
     let export_opts = starbreaker_3d::ExportOptions::from(&opts);
-    let output = output.unwrap_or_else(|| PathBuf::from(format!("{name}.glb")));
+    let output = output.unwrap_or_else(|| {
+        match export_opts.kind {
+            starbreaker_3d::ExportKind::Bundled => {
+                PathBuf::from(format!("{export_name}.{}", bundled_extension(export_opts.format)))
+            }
+            starbreaker_3d::ExportKind::Decomposed => PathBuf::from(name.clone()),
+        }
+    });
+    let existing_asset_paths = if export_opts.kind == starbreaker_3d::ExportKind::Decomposed
+        && opts.skip_existing_assets
+    {
+        Some(collect_existing_decomposed_assets(&output)?)
+    } else {
+        None
+    };
 
     crate::log_mem_stats("before loadout resolve");
     let tree = resolve_loadout_indexed(&idx, record);
@@ -116,14 +274,53 @@ fn export(
     }
 
     crate::log_mem_stats("before export");
-    let result = starbreaker_3d::assemble_glb_with_loadout(&db, &p4k, record, &tree, &export_opts)?;
-
+    let result = starbreaker_3d::assemble_glb_with_loadout_with_progress(
+        &db,
+        &p4k,
+        record,
+        &tree,
+        &export_opts,
+        None,
+        existing_asset_paths.as_ref(),
+    )?;
     crate::log_mem_stats("after export");
     eprintln!("Geometry: {}", result.geometry_path);
     eprintln!("Material: {}", result.material_path);
-    eprintln!("GLB size: {} bytes", result.glb.len());
-    std::fs::write(&output, &result.glb)
-        .map_err(|e| CliError::IoPath { source: e, path: output.display().to_string() })?;
+    match result.kind {
+        starbreaker_3d::ExportKind::Bundled => {
+            let bundled_bytes = result.bundled_bytes().ok_or_else(|| {
+                CliError::InvalidInput(format!(
+                    "entity export returned non-bundled output for {:?}",
+                    result.kind,
+                ))
+            })?;
+            eprintln!("Bundled export size: {} bytes", bundled_bytes.len());
+            std::fs::write(&output, bundled_bytes)
+                .map_err(|e| CliError::IoPath { source: e, path: output.display().to_string() })?;
+        }
+        starbreaker_3d::ExportKind::Decomposed => {
+            let decomposed = result.decomposed.as_ref().ok_or_else(|| {
+                CliError::InvalidInput("entity export returned no decomposed files".into())
+            })?;
+            eprintln!("Decomposed export file count: {}", decomposed.files.len());
+            // The decomposed exporter names its package folder with a
+            // `_LOD<n>_TEX<n>` suffix. Use that exact name here so we clean
+            // the right directory and don't leave an empty sibling folder.
+            let package_name = format!(
+                "{export_name}_LOD{}_TEX{}",
+                export_opts.lod_level, export_opts.texture_mip
+            );
+            prepare_decomposed_output_root(&output, &package_name)?;
+            for file in &decomposed.files {
+                let output_path = output.join(&file.relative_path);
+                if let Some(parent) = output_path.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| CliError::IoPath { source: e, path: parent.display().to_string() })?;
+                }
+                write_decomposed_file(file, &output_path, opts.skip_existing_assets)?;
+            }
+        }
+    }
     crate::log_mem_stats("after write");
     eprintln!("Written to {}", output.display());
     Ok(())
