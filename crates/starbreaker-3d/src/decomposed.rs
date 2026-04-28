@@ -3348,8 +3348,9 @@ mod tests {
         );
         let full_path = base_dir.join(texture_path);
 
+        // Normalize separators: Path::join uses '\\' on Windows.
         assert_eq!(
-            full_path.to_string_lossy(),
+            full_path.to_string_lossy().replace('\\', "/"),
             "/tmp/export-root/Data/Objects/Ships/Test/hull_diff.png"
         );
     }
