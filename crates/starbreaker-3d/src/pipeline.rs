@@ -675,60 +675,88 @@ pub fn assemble_glb_with_loadout_with_progress(
     let mut child_payloads: Vec<EntityPayload> = Vec::new();
     report_progress(progress, 0.28, "Flattening attachments");
     if opts.include_attachments {
+        let mut gear_cache: HashMap<String, LandingGearAsset> = HashMap::new();
         for (gear_path, bone_name) in &gear_parts {
-            match export_entity_from_paths(p4k, gear_path, "", &child_opts) {
-                Ok((
-                    gear_mesh,
-                    gear_mtl,
-                    _,
-                    gear_nmc,
-                    _,
-                    gear_geometry_path,
-                    gear_material_path,
-                    gear_bones,
-                    gear_skeleton_source_path,
-                )) => {
-                    let verts = gear_mesh.positions.len();
-                    let textures = if child_payload_material_mode.include_textures() {
-                        gear_mtl.as_ref().map(|materials| {
-                            let mut png_cache = PngCache::new();
-                            load_material_textures(
-                                p4k,
-                                materials,
-                                root_palette.as_ref(),
-                                opts.texture_mip,
-                                &mut png_cache,
-                                child_payload_material_mode.include_normals(),
-                                child_payload_material_mode.experimental(),
-                            )
-                        })
-                    } else {
+            let asset = if let Some(cached) = gear_cache.get(gear_path.as_str()) {
+                log::info!("  mesh cache hit for landing gear '{gear_path}'");
+                Some(cached.clone())
+            } else {
+                match export_entity_from_paths(p4k, gear_path, "", &child_opts) {
+                    Ok((
+                        gear_mesh,
+                        gear_mtl,
+                        _,
+                        gear_nmc,
+                        _,
+                        gear_geometry_path,
+                        gear_material_path,
+                        gear_bones,
+                        gear_skeleton_source_path,
+                    )) => {
+                        let textures = if child_payload_material_mode.include_textures() {
+                            gear_mtl.as_ref().map(|materials| {
+                                let mut png_cache = PngCache::new();
+                                load_material_textures(
+                                    p4k,
+                                    materials,
+                                    root_palette.as_ref(),
+                                    opts.texture_mip,
+                                    &mut png_cache,
+                                    child_payload_material_mode.include_normals(),
+                                    child_payload_material_mode.experimental(),
+                                )
+                            })
+                        } else {
+                            None
+                        };
+                        let new_asset = LandingGearAsset {
+                            mesh: gear_mesh,
+                            materials: gear_mtl,
+                            textures,
+                            nmc: gear_nmc,
+                            geometry_path: gear_geometry_path,
+                            material_path: gear_material_path,
+                            bones: gear_bones,
+                            skeleton_source_path: gear_skeleton_source_path,
+                        };
+                        gear_cache.insert(gear_path.clone(), new_asset.clone());
+                        Some(new_asset)
+                    }
+                    Err(e) => {
+                        log::warn!("  landing gear '{gear_path}' failed: {e}");
                         None
-                    };
-                    child_payloads.push(EntityPayload {
-                        mesh: gear_mesh,
-                        materials: gear_mtl,
-                        textures,
-                        nmc: gear_nmc,
-                        palette: root_palette.clone(),
-                        geometry_path: gear_geometry_path,
-                        material_path: gear_material_path,
-                        bones: gear_bones,
-                        skeleton_source_path: gear_skeleton_source_path,
-                        entity_name: gear_path.rsplit('/').next().unwrap_or(gear_path).to_string(),
-                        parent_node_name: bone_name.clone(),
-                        parent_entity_name: resolved.entity_name.clone(),
-                        no_rotation: false,
-                        offset_position: [0.0; 3],
-                        offset_rotation: [0.0; 3],
-                        detach_direction: [0.0; 3],
-                        port_flags: String::new(),
-                    });
-                    log::info!("  landing gear '{gear_path}' → '{bone_name}', {verts} verts");
+                    }
                 }
-                Err(e) => log::warn!("  landing gear '{gear_path}' failed: {e}"),
+            };
+            if let Some(asset) = asset {
+                let verts = asset.mesh.positions.len();
+                child_payloads.push(EntityPayload {
+                    mesh: asset.mesh,
+                    materials: asset.materials,
+                    textures: asset.textures,
+                    nmc: asset.nmc,
+                    palette: root_palette.clone(),
+                    geometry_path: asset.geometry_path,
+                    material_path: asset.material_path,
+                    bones: asset.bones,
+                    skeleton_source_path: asset.skeleton_source_path,
+                    entity_name: gear_path.rsplit('/').next().unwrap_or(gear_path).to_string(),
+                    parent_node_name: bone_name.clone(),
+                    parent_entity_name: resolved.entity_name.clone(),
+                    no_rotation: false,
+                    offset_position: [0.0; 3],
+                    offset_rotation: [0.0; 3],
+                    detach_direction: [0.0; 3],
+                    port_flags: String::new(),
+                });
+                log::info!("  landing gear '{gear_path}' → '{bone_name}', {verts} verts");
             }
         }
+        log::info!(
+            "[gear] {} hardpoints, {} unique CGFs cached",
+            gear_parts.len(),
+            gear_cache.len(),
+        );
         flatten_resolved_tree(
             &resolved.children,
             &resolved.entity_name,
@@ -1019,6 +1047,21 @@ struct LoadedChildPayload {
     bones: Vec<crate::skeleton::Bone>,
     geometry_path: String,
     material_path: String,
+    skeleton_source_path: Option<String>,
+}
+
+/// Cached result of loading a landing-gear CGF. Multiple gear hardpoints
+/// often share the same geometry (e.g. mirrored gears), so this cache
+/// dedupes P4k reads and texture decoding by gear_path.
+#[derive(Clone)]
+struct LandingGearAsset {
+    mesh: crate::types::Mesh,
+    materials: Option<mtl::MtlFile>,
+    textures: Option<MaterialTextures>,
+    nmc: Option<nmc::NodeMeshCombo>,
+    geometry_path: String,
+    material_path: String,
+    bones: Vec<crate::skeleton::Bone>,
     skeleton_source_path: Option<String>,
 }
 
