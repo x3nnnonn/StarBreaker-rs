@@ -5329,7 +5329,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "starbreaker"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -5343,13 +5343,13 @@ dependencies = [
  "rayon",
  "regex",
  "serde_json",
+ "starbreaker-3d",
  "starbreaker-chf",
  "starbreaker-chunks",
  "starbreaker-common",
  "starbreaker-cryxml",
  "starbreaker-datacore",
  "starbreaker-dds",
- "starbreaker-gltf",
  "starbreaker-p4k",
  "starbreaker-wem",
  "starbreaker-wwise",
@@ -5357,116 +5357,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "starbreaker-app"
-version = "0.2.1"
+name = "starbreaker-3d"
+version = "0.2.2"
 dependencies = [
- "futures-lite",
- "image",
- "log",
- "parking_lot",
- "rayon",
- "serde",
- "serde_json",
- "starbreaker-common",
- "starbreaker-cryxml",
- "starbreaker-datacore",
- "starbreaker-dds",
- "starbreaker-gltf",
- "starbreaker-p4k",
- "starbreaker-wem",
- "starbreaker-wwise",
- "system-theme",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-log",
- "tauri-plugin-process",
- "tauri-plugin-shell",
- "tauri-plugin-store",
- "tauri-plugin-updater",
- "thiserror 2.0.18",
- "tokio",
-]
-
-[[package]]
-name = "starbreaker-chf"
-version = "0.2.1"
-dependencies = [
- "crc32c",
- "hex",
- "reqwest 0.12.28",
- "ruzstd",
- "serde",
- "serde_json",
- "starbreaker-common",
- "thiserror 2.0.18",
- "zerocopy",
-]
-
-[[package]]
-name = "starbreaker-chunks"
-version = "0.2.1"
-dependencies = [
- "starbreaker-common",
- "thiserror 2.0.18",
- "zerocopy",
-]
-
-[[package]]
-name = "starbreaker-common"
-version = "0.2.1"
-dependencies = [
- "crc32c",
- "criterion",
- "parking_lot",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "zerocopy",
-]
-
-[[package]]
-name = "starbreaker-cryxml"
-version = "0.2.1"
-dependencies = [
- "starbreaker-common",
- "thiserror 2.0.18",
- "zerocopy",
-]
-
-[[package]]
-name = "starbreaker-datacore"
-version = "0.2.1"
-dependencies = [
- "criterion",
- "log",
- "memmap2",
- "quick-xml 0.37.5",
- "rayon",
- "rustc-hash",
- "serde",
- "serde_json",
- "starbreaker-common",
- "starbreaker-p4k",
- "thiserror 2.0.18",
- "zerocopy",
-]
-
-[[package]]
-name = "starbreaker-dds"
-version = "0.2.1"
-dependencies = [
- "bcdec_rs",
- "image",
- "starbreaker-common",
- "thiserror 2.0.18",
- "zerocopy",
-]
-
-[[package]]
-name = "starbreaker-gltf"
-version = "0.2.1"
-dependencies = [
+ "crc32fast",
  "env_logger",
  "glam",
  "gltf-json",
@@ -5486,8 +5380,115 @@ dependencies = [
 ]
 
 [[package]]
+name = "starbreaker-app"
+version = "0.2.2"
+dependencies = [
+ "futures-lite",
+ "image",
+ "log",
+ "parking_lot",
+ "rayon",
+ "serde",
+ "serde_json",
+ "starbreaker-3d",
+ "starbreaker-common",
+ "starbreaker-cryxml",
+ "starbreaker-datacore",
+ "starbreaker-dds",
+ "starbreaker-p4k",
+ "starbreaker-wem",
+ "starbreaker-wwise",
+ "system-theme",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-log",
+ "tauri-plugin-process",
+ "tauri-plugin-shell",
+ "tauri-plugin-store",
+ "tauri-plugin-updater",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "starbreaker-chf"
+version = "0.2.2"
+dependencies = [
+ "crc32c",
+ "hex",
+ "reqwest 0.12.28",
+ "ruzstd",
+ "serde",
+ "serde_json",
+ "starbreaker-common",
+ "thiserror 2.0.18",
+ "zerocopy",
+]
+
+[[package]]
+name = "starbreaker-chunks"
+version = "0.2.2"
+dependencies = [
+ "starbreaker-common",
+ "thiserror 2.0.18",
+ "zerocopy",
+]
+
+[[package]]
+name = "starbreaker-common"
+version = "0.2.2"
+dependencies = [
+ "crc32c",
+ "criterion",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "zerocopy",
+]
+
+[[package]]
+name = "starbreaker-cryxml"
+version = "0.2.2"
+dependencies = [
+ "starbreaker-common",
+ "thiserror 2.0.18",
+ "zerocopy",
+]
+
+[[package]]
+name = "starbreaker-datacore"
+version = "0.2.2"
+dependencies = [
+ "criterion",
+ "log",
+ "memmap2",
+ "quick-xml 0.37.5",
+ "rayon",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "starbreaker-common",
+ "starbreaker-p4k",
+ "thiserror 2.0.18",
+ "zerocopy",
+]
+
+[[package]]
+name = "starbreaker-dds"
+version = "0.2.2"
+dependencies = [
+ "bcdec_rs",
+ "image",
+ "starbreaker-common",
+ "thiserror 2.0.18",
+ "zerocopy",
+]
+
+[[package]]
 name = "starbreaker-mcp"
-version = "0.1.0"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -5499,19 +5500,19 @@ dependencies = [
  "schemars 1.2.1",
  "serde",
  "serde_json",
+ "starbreaker-3d",
  "starbreaker-chunks",
  "starbreaker-common",
  "starbreaker-cryxml",
  "starbreaker-datacore",
  "starbreaker-dds",
- "starbreaker-gltf",
  "starbreaker-p4k",
  "tokio",
 ]
 
 [[package]]
 name = "starbreaker-p4k"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aes",
  "cbc",
@@ -5526,7 +5527,7 @@ dependencies = [
 
 [[package]]
 name = "starbreaker-wem"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "starbreaker-common",
  "thiserror 2.0.18",
@@ -5536,7 +5537,7 @@ dependencies = [
 
 [[package]]
 name = "starbreaker-wwise"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "quick-xml 0.37.5",
  "serde",

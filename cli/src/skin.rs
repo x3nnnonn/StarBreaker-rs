@@ -20,6 +20,19 @@ pub enum SkinCommand {
         #[arg(long, env = "SC_DATA_P4K")]
         p4k: Option<PathBuf>,
     },
+    /// Inspect a .skinm/.skin/.cgfm/.chr file and print parsed metadata
+    Inspect {
+        /// P4k path substring (case-insensitive)
+        path: String,
+        /// Path to Data.p4k
+        #[arg(long, env = "SC_DATA_P4K")]
+        p4k: Option<PathBuf>,
+        /// For .skinm files: dump per-vertex bone weight statistics
+        /// (max influence count, weight distribution, vertices weighted to
+        /// multiple bones).
+        #[arg(long)]
+        bone_weights: bool,
+    },
     /// Scan all mesh files and report stream/chunk type statistics
     ScanStreams {
         /// Path to Data.p4k
@@ -40,6 +53,7 @@ impl SkinCommand {
     pub fn run(self) -> Result<()> {
         match self {
             Self::Export { path, output, p4k } => export(path, output, p4k),
+            Self::Inspect { path, p4k, bone_weights } => inspect(path, p4k, bone_weights),
             Self::ScanStreams { p4k } => scan_streams(p4k),
             Self::FindStream { stream_id, p4k } => find_stream(stream_id, p4k),
         }
@@ -293,7 +307,7 @@ fn export(search: String, output: Option<PathBuf>, p4k_path: Option<PathBuf>) ->
 
     eprintln!("Found: {}", entry.name);
     let data = p4k.read(entry)?;
-    let glb = starbreaker_gltf::skin_to_glb(&data)?;
+    let glb = starbreaker_3d::skin_to_glb(&data, None)?;
 
     let output = output.unwrap_or_else(|| {
         let stem = entry.name.rsplit(['/', '\\']).next().unwrap_or("output");
@@ -303,5 +317,151 @@ fn export(search: String, output: Option<PathBuf>, p4k_path: Option<PathBuf>) ->
     std::fs::write(&output, &glb)
         .map_err(|e| CliError::IoPath { source: e, path: output.display().to_string() })?;
     eprintln!("Written {} bytes to {}", glb.len(), output.display());
+    Ok(())
+}
+
+fn inspect(search: String, p4k_path: Option<PathBuf>, bone_weights: bool) -> Result<()> {
+    use starbreaker_chunks::ChunkFile;
+
+    let p4k = load_p4k(p4k_path.as_deref())?;
+    let search_lower = search.to_lowercase();
+
+    let entry = p4k
+        .entries()
+        .iter()
+        .find(|e| {
+            let name = e.name.to_lowercase();
+            // Prefer exact suffix match if search includes an extension
+            if let Some(dot) = search_lower.rfind('.') {
+                let search_ext = &search_lower[dot..];
+                if !name.ends_with(search_ext) {
+                    return false;
+                }
+            }
+            name.contains(&search_lower)
+                && (name.ends_with(".skinm")
+                    || name.ends_with(".skin")
+                    || name.ends_with(".cgfm")
+                    || name.ends_with(".chr"))
+        })
+        .ok_or_else(|| CliError::NotFound(format!(
+            "no .skinm/.skin/.cgfm/.chr file matching '{search}' in P4k"
+        )))?;
+
+    println!("Found: {}", entry.name);
+    let data = p4k.read(entry)?;
+
+    let lower_name = entry.name.to_lowercase();
+    let is_skel_file = lower_name.ends_with(".chr") || lower_name.ends_with(".skin");
+    if is_skel_file {
+        if let Some(bones) = starbreaker_3d::skeleton::parse_skeleton(&data) {
+            println!("Skeleton bones: {}", bones.len());
+            for (index, bone) in bones.iter().enumerate() {
+                println!(
+                    "  [{index}] {} parent={:?} object_node_index={:?} local_pos={:?} local_rot={:?} world_pos={:?} world_rot={:?}",
+                    bone.name,
+                    bone.parent_index,
+                    bone.object_node_index,
+                    bone.local_position,
+                    bone.local_rotation,
+                    bone.world_position,
+                    bone.world_rotation,
+                );
+            }
+            return Ok(());
+        }
+        return Err(CliError::InvalidInput(format!(
+            "failed to parse skeleton from {}",
+            entry.name
+        )));
+    }
+
+    let chunk_file = ChunkFile::from_bytes(&data)
+        .map_err(|error| CliError::InvalidInput(format!("failed to parse chunk file {}: {error}", entry.name)))?;
+    let ChunkFile::Ivo(ivo) = chunk_file else {
+        return Err(CliError::InvalidInput(format!("unsupported non-IVO mesh file {}", entry.name)));
+    };
+
+    let skin_entry = ivo
+        .chunks()
+        .iter()
+        .find(|chunk| chunk.chunk_type == starbreaker_chunks::known_types::ivo::IVO_SKIN2)
+        .ok_or_else(|| CliError::InvalidInput(format!("no IVO_SKIN2 chunk in {}", entry.name)))?;
+
+    let skin = starbreaker_3d::ivo::skin::SkinMesh::read(ivo.chunk_data(skin_entry))
+        .map_err(|error| CliError::InvalidInput(format!("failed to parse skin mesh {}: {error}", entry.name)))?;
+
+    println!(
+        "SkinMesh flags={} verts={} indices={} submeshes={} extra_words={:?}",
+        skin.flags,
+        skin.info.num_vertices,
+        skin.info.num_indices,
+        skin.info.num_submeshes,
+        skin.extra_words,
+    );
+    for (index, submesh) in skin.submeshes.iter().enumerate() {
+        println!(
+            "  submesh[{index}] node_parent={} first_index={} num_indices={} first_vertex={} num_vertices={} center={:?} radius={} unknown0=0x{:08X} unknown1=0x{:08X}",
+            submesh.node_parent_index,
+            submesh.first_index,
+            submesh.num_indices,
+            submesh.first_vertex,
+            submesh.num_vertices,
+            submesh.center,
+            submesh.radius,
+            submesh.unknown0,
+            submesh.unknown1,
+        );
+    }
+
+    if bone_weights {
+        match &skin.streams.bone_maps {
+            None => println!("\n[bone-weights] mesh has no bone_maps stream — purely rigid"),
+            Some(maps) => {
+                println!("\n[bone-weights] {} vertices total", maps.len());
+
+                // Influence-count histogram: how many vertices have 1, 2, 3, 4 non-zero weights?
+                let mut influence_hist = [0usize; 5];
+                let mut joint_usage: HashMap<u16, usize> = HashMap::new();
+                let mut multi_bone_examples: Vec<(usize, [u16; 4], [u8; 4])> = vec![];
+
+                for (vid, bm) in maps.iter().enumerate() {
+                    let n = bm.weights.iter().filter(|w| **w > 0).count();
+                    influence_hist[n] += 1;
+                    for slot in 0..4 {
+                        if bm.weights[slot] > 0 {
+                            *joint_usage.entry(bm.joint_indices[slot]).or_insert(0) += 1;
+                        }
+                    }
+                    if n >= 2 && multi_bone_examples.len() < 16 {
+                        multi_bone_examples.push((vid, bm.joint_indices, bm.weights));
+                    }
+                }
+
+                println!("\nInfluence-count histogram (verts weighted to N non-zero bones):");
+                for n in 0..=4 {
+                    let pct = (influence_hist[n] as f64 / maps.len() as f64) * 100.0;
+                    println!("  {n}-bone: {:>8} ({:>5.1}%)", influence_hist[n], pct);
+                }
+
+                println!("\nJoint usage (vertices weighted to each bone, sorted by count):");
+                let mut sorted_joints: Vec<_> = joint_usage.into_iter().collect();
+                sorted_joints.sort_by(|a, b| b.1.cmp(&a.1));
+                for (joint, count) in sorted_joints.iter().take(20) {
+                    println!("  joint[{:>3}]: {:>8} verts", joint, count);
+                }
+
+                if !multi_bone_examples.is_empty() {
+                    println!("\nFirst {} vertices with multi-bone weights:", multi_bone_examples.len());
+                    for (vid, joints, weights) in &multi_bone_examples {
+                        println!(
+                            "  vert[{:>5}] joints={:?} weights={:?}",
+                            vid, joints, weights
+                        );
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }

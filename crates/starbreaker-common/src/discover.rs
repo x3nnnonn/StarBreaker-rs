@@ -16,14 +16,43 @@
 //! SC_DATA_P4K = "C:\\Program Files\\Roberts Space Industries\\StarCitizen\\LIVE\\Data.p4k"
 //! SC_EXE = "C:\\Program Files\\Roberts Space Industries\\StarCitizen\\LIVE\\Bin64\\StarCitizen.exe"
 //! ```
+//!
+//! On Linux, StarBreaker also auto-scans the common Wine or Proton install root:
+//!
+//! ```text
+//! ~/Games/star-citizen/drive_c/Program Files/Roberts Space Industries/StarCitizen/
+//! ```
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Known Star Citizen channel names, in preference order.
 pub const CHANNELS: &[&str] = &["LIVE", "PTU", "EPTU", "TECH-PREVIEW"];
 
 /// Default install root on Windows.
 pub const DEFAULT_ROOT: &str = r"C:\Program Files\Roberts Space Industries\StarCitizen";
+/// Common install root on Linux Wine or Proton setups.
+pub const DEFAULT_ROOT_LINUX: &str = "Games/star-citizen/drive_c/Program Files/Roberts Space Industries/StarCitizen";
+
+fn default_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    if cfg!(target_os = "linux") {
+        if let Some(home) = std::env::var_os("HOME") {
+            roots.push(PathBuf::from(home).join(DEFAULT_ROOT_LINUX));
+        }
+    }
+
+    roots.push(PathBuf::from(DEFAULT_ROOT));
+    roots
+}
+
+fn default_root_message() -> String {
+    default_roots()
+        .into_iter()
+        .map(|root| format!("'{}'", root.display()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// Environment variable for overriding the P4K path.
 pub const ENV_P4K: &str = "SC_DATA_P4K";
@@ -61,20 +90,26 @@ pub fn find_file(env_var: &str, relative_path: &str) -> Result<Discovered, Disco
     }
 
     // 2. Auto-scan default locations
-    let root = Path::new(DEFAULT_ROOT);
-    if !root.is_dir() {
+    let roots = default_roots();
+    if !roots.iter().any(|root| root.is_dir()) {
         return Err(DiscoverError::NotInstalled);
     }
 
     let mut candidates: Vec<(PathBuf, String, std::time::SystemTime)> = Vec::new();
-    for &channel in CHANNELS {
-        let file = root.join(channel).join(relative_path);
-        if file.is_file() {
-            let mtime = file
-                .metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(std::time::UNIX_EPOCH);
-            candidates.push((file, channel.to_string(), mtime));
+    for root in roots {
+        if !root.is_dir() {
+            continue;
+        }
+
+        for &channel in CHANNELS {
+            let file = root.join(channel).join(relative_path);
+            if file.is_file() {
+                let mtime = file
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::UNIX_EPOCH);
+                candidates.push((file, channel.to_string(), mtime));
+            }
         }
     }
 
@@ -110,23 +145,21 @@ pub fn find_all_p4k() -> Vec<Discovered> {
         }
     }
 
-    let root = Path::new(DEFAULT_ROOT);
-    if !root.is_dir() {
-        return Vec::new();
-    }
-
-    CHANNELS
-        .iter()
-        .filter_map(|&channel| {
-            let file = root.join(channel).join("Data.p4k");
-            if file.is_file() {
-                Some(Discovered {
-                    path: file,
-                    source: channel.to_string(),
-                })
-            } else {
-                None
-            }
+    default_roots()
+        .into_iter()
+        .filter(|root| root.is_dir())
+        .flat_map(|root| {
+            CHANNELS.iter().filter_map(move |&channel| {
+                let file = root.join(channel).join("Data.p4k");
+                if file.is_file() {
+                    Some(Discovered {
+                        path: file,
+                        source: channel.to_string(),
+                    })
+                } else {
+                    None
+                }
+            })
         })
         .collect()
 }
@@ -154,15 +187,55 @@ impl std::fmt::Display for DiscoverError {
             }
             DiscoverError::NotInstalled => write!(
                 f,
-                "Star Citizen not found at '{DEFAULT_ROOT}'; pass --p4k or set {ENV_P4K}"
+                "Star Citizen not found in default locations ({}); pass --p4k or set {ENV_P4K}",
+                default_root_message()
             ),
             DiscoverError::NotFound { relative_path } => write!(
                 f,
-                "no '{relative_path}' found in any channel ({}) under '{DEFAULT_ROOT}'; pass --p4k or set {ENV_P4K}",
-                CHANNELS.join(", ")
+                "no '{relative_path}' found in any channel ({}) under default locations ({}); pass --p4k or set {ENV_P4K}",
+                CHANNELS.join(", "),
+                default_root_message(),
             ),
         }
     }
 }
 
 impl std::error::Error for DiscoverError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_roots_include_platform_defaults() {
+        let roots = default_roots();
+        assert!(roots.iter().any(|root| root == &PathBuf::from(DEFAULT_ROOT)));
+
+        if cfg!(target_os = "linux") {
+            let expected = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(DEFAULT_ROOT_LINUX));
+            if let Some(expected) = expected {
+                assert!(roots.iter().any(|root| root == &expected));
+            }
+        }
+    }
+
+    #[test]
+    fn linux_default_root_constant_matches_expected_layout() {
+        assert_eq!(
+            DEFAULT_ROOT_LINUX,
+            "Games/star-citizen/drive_c/Program Files/Roberts Space Industries/StarCitizen"
+        );
+    }
+
+    #[test]
+    fn default_root_message_lists_linux_root_when_applicable() {
+        let message = default_root_message();
+        assert!(message.contains(DEFAULT_ROOT));
+
+        if cfg!(target_os = "linux") {
+            assert!(message.contains(DEFAULT_ROOT_LINUX));
+        }
+    }
+}

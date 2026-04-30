@@ -6,6 +6,7 @@ mod dds;
 mod entity;
 mod error;
 mod glb;
+mod nmc;
 mod p4k;
 mod skin;
 mod socpak;
@@ -13,7 +14,6 @@ mod wwise;
 
 use clap::{Parser, Subcommand};
 
-// ── Tracking allocator ──────────────────────────────────────────────────────
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
@@ -137,6 +137,11 @@ enum Command {
         #[command(subcommand)]
         command: wwise::WwiseCommand,
     },
+    /// NMC (Node Mesh Combo) chunk inspection from `.cga` / `.cgf` files
+    Nmc {
+        #[command(subcommand)]
+        command: nmc::NmcCommand,
+    },
 }
 
 fn main() {
@@ -150,9 +155,7 @@ fn main() {
         }
         .to_string()
     });
-    env_logger::Builder::new()
-        .parse_filters(&env_filter)
-        .init();
+    env_logger::Builder::new().parse_filters(&env_filter).init();
 
     if cli.mem_cap > 0 {
         set_mem_cap(cli.mem_cap * 1_048_576);
@@ -170,6 +173,7 @@ fn main() {
         Command::Glb { command } => command.run(),
         Command::Chf { command } => command.run(),
         Command::Wwise { command } => command.run(),
+        Command::Nmc { command } => command.run(),
     };
 
     if let Err(e) = result {

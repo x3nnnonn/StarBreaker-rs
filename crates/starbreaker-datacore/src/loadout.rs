@@ -2,7 +2,7 @@ use crate::database::Database;
 use crate::query::compile::CompiledPath;
 use crate::query::value::Value;
 use crate::types::{Record, StructId};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// A node in the resolved loadout tree.
 #[derive(Debug)]
@@ -23,6 +23,10 @@ pub struct LoadoutNode {
     pub offset_position: [f32; 3],
     /// Item port helper offset rotation (Euler angles in degrees, CryEngine convention).
     pub offset_rotation: [f32; 3],
+    /// Item port detach direction from the parent port definition, in port-local source axes.
+    pub detach_direction: [f32; 3],
+    /// Raw item port flags from SItemPortDef (e.g. "invisible uneditable").
+    pub port_flags: String,
     /// Port tags from SItemPortContainerComponentParams (e.g., for SubGeometry variant selection).
     pub port_tags: String,
     /// Geometry file path from SGeometryResourceParams, if present.
@@ -157,18 +161,7 @@ impl<'a> EntityIndex<'a> {
             let sub_arr = get_array_field(geom_node, "SubGeometry");
             if let Some(sub_geom_arr) = sub_arr {
                 for sub in sub_geom_arr {
-                    let tag = get_string_field(sub, "Tags").unwrap_or("").to_string();
-                    let (geom, mtl) = extract_sub_geometry_paths(sub);
-                    if tag.is_empty() {
-                        continue;
-                    }
-                    if let Some(geom_path) = geom {
-                        variants.push(SubGeometryVariant {
-                            tag,
-                            geometry_path: geom_path,
-                            material_path: mtl.unwrap_or_default(),
-                        });
-                    }
+                    collect_sub_geometry_variants(sub, &[], &mut variants);
                 }
             }
         }
@@ -276,6 +269,8 @@ struct PortInfo {
     no_rotation: bool,
     offset_position: [f32; 3],
     offset_rotation: [f32; 3],
+    detach_direction: [f32; 3],
+    port_flags: String,
     port_tags: String,
 }
 
@@ -349,11 +344,21 @@ fn build_port_info_map(db: &Database, record: &Record) -> HashMap<String, PortIn
                     .unwrap_or("")
                     .to_string();
 
+                let detach_direction = get_object_field(port, "detachDirection")
+                    .map(|direction| [
+                        get_f32_field(direction, "x").unwrap_or(0.0),
+                        get_f32_field(direction, "y").unwrap_or(0.0),
+                        get_f32_field(direction, "z").unwrap_or(0.0),
+                    ])
+                    .unwrap_or([0.0; 3]);
+
                 map.insert(port_name.to_string(), PortInfo {
                     bone_name,
                     no_rotation,
                     offset_position,
                     offset_rotation,
+                    detach_direction,
+                    port_flags: get_string_field(port, "Flags").unwrap_or("").to_string(),
                     port_tags,
                 });
             }
@@ -372,6 +377,8 @@ fn apply_port_info(db: &Database, parent_record: &Record, children: &mut [Loadou
             child.no_rotation = info.no_rotation;
             child.offset_position = info.offset_position;
             child.offset_rotation = info.offset_rotation;
+            child.detach_direction = info.detach_direction;
+            child.port_flags = info.port_flags.clone();
             child.port_tags = info.port_tags.clone();
             if info.offset_position != [0.0; 3] || info.offset_rotation != [0.0; 3] {
                 log::debug!(
@@ -405,14 +412,23 @@ fn resolve_sub_geometry(idx: &EntityIndex, children: &mut [LoadoutNode]) {
             child.geometry_path = Some(m.geometry_path.clone());
             if !m.material_path.is_empty() { child.material_path = Some(m.material_path.clone()); }
         } else if variants.len() > 1 {
-            log::warn!(
-                "  SubGeometry: {} has {} variants but none matched port='{}' bone='{}' tags='{}'. Variants: [{}]",
-                child.entity_name, variants.len(), child.item_port_name,
-                child.helper_bone_name.as_deref().unwrap_or(""),
-                child.port_tags,
-                variants.iter().map(|v| format!("{}:{}", v.tag, v.geometry_path)).collect::<Vec<_>>().join(", ")
-            );
-            unmatched.push(i);
+            if has_multiple_geometry_variants(&variants) {
+                log::warn!(
+                    "  SubGeometry: {} has {} variants but none matched port='{}' bone='{}' tags='{}'. Variants: [{}]",
+                    child.entity_name, variants.len(), child.item_port_name,
+                    child.helper_bone_name.as_deref().unwrap_or(""),
+                    child.port_tags,
+                    variants.iter().map(|v| format!("{}:{}", v.tag, v.geometry_path)).collect::<Vec<_>>().join(", ")
+                );
+                unmatched.push(i);
+            } else {
+                log::debug!(
+                    "  SubGeometry: {} has {} material-only variants with no selector match; keeping default geometry {}",
+                    child.entity_name,
+                    variants.len(),
+                    child.geometry_path.as_deref().unwrap_or("")
+                );
+            }
         }
     }
 
@@ -439,6 +455,17 @@ fn resolve_sub_geometry(idx: &EntityIndex, children: &mut [LoadoutNode]) {
     }
 }
 
+fn has_multiple_geometry_variants(variants: &[SubGeometryVariant]) -> bool {
+    let mut geometry_paths = HashSet::new();
+    for variant in variants {
+        geometry_paths.insert(variant.geometry_path.to_ascii_lowercase());
+        if geometry_paths.len() > 1 {
+            return true;
+        }
+    }
+    false
+}
+
 /// Match SubGeometry variants against port tags, helper bone name, or item port name.
 /// Priority: 1) port_tags, 2) helper_bone_name, 3) item_port_name.
 /// This mirrors scdatatools' behavior where the helper (bone) name is the primary
@@ -450,38 +477,99 @@ fn match_sub_geometry_variant<'a>(
     item_port_name: &str,
 ) -> Option<&'a SubGeometryVariant> {
     // 1. Try match against port_tags
-    if !port_tags.is_empty() {
-        let tags_lower = port_tags.to_lowercase();
-        for v in variants {
-            if tags_lower.contains(&v.tag.to_lowercase()) {
-                return Some(v);
-            }
-        }
+    if !port_tags.is_empty()
+        && let Some(variant) = best_sub_geometry_variant_match(variants, port_tags)
+    {
+        return Some(variant);
     }
 
     // 2. Try SubGeometry tag as substring of helper bone name
     //    (scdatatools' primary matching strategy — the bone name often contains
     //     variant-specific identifiers like "left", "right", "center")
-    if let Some(bone) = helper_bone_name {
-        let bone_lower = bone.to_lowercase();
-        for v in variants {
-            let tag_lower = v.tag.to_lowercase();
-            if bone_lower.contains(&tag_lower) {
-                return Some(v);
-            }
-        }
+    if let Some(bone) = helper_bone_name
+        && let Some(variant) = best_sub_geometry_variant_match(variants, bone)
+    {
+        return Some(variant);
     }
 
     // 3. Try SubGeometry tag as substring of item_port_name
-    let port_lower = item_port_name.to_lowercase();
-    for v in variants {
-        let tag_lower = v.tag.to_lowercase();
-        if port_lower.contains(&tag_lower) {
-            return Some(v);
+    best_sub_geometry_variant_match(variants, item_port_name)
+}
+
+fn collect_sub_geometry_variants(
+    node: &Value,
+    parent_tags: &[String],
+    variants: &mut Vec<SubGeometryVariant>,
+) {
+    let mut combined_tags = parent_tags.to_vec();
+    if let Some(tag) = get_string_field(node, "Tags") {
+        append_selector_tokens(&mut combined_tags, tag);
+    }
+
+    let (geom, mtl) = extract_sub_geometry_paths(node);
+    if let Some(geometry_path) = geom {
+        let tag = combined_tags.join(" ");
+        if !tag.is_empty()
+            && !variants.iter().any(|variant| {
+                variant.tag.eq_ignore_ascii_case(&tag)
+                    && variant.geometry_path.eq_ignore_ascii_case(&geometry_path)
+            })
+        {
+            variants.push(SubGeometryVariant {
+                tag,
+                geometry_path,
+                material_path: mtl.unwrap_or_default(),
+            });
         }
     }
 
-    None
+    if let Some(children) = get_array_field(node, "SubGeometry") {
+        for child in children {
+            collect_sub_geometry_variants(child, &combined_tags, variants);
+        }
+    }
+}
+
+fn append_selector_tokens(tokens: &mut Vec<String>, raw: &str) {
+    for token in selector_tokens(raw) {
+        if !tokens.iter().any(|existing| existing == &token) {
+            tokens.push(token);
+        }
+    }
+}
+
+fn selector_tokens(raw: &str) -> Vec<String> {
+    raw.split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_ascii_lowercase())
+        .collect()
+}
+
+fn best_sub_geometry_variant_match<'a>(
+    variants: &'a [SubGeometryVariant],
+    selector: &str,
+) -> Option<&'a SubGeometryVariant> {
+    let selector_token_set: HashSet<String> = selector_tokens(selector).into_iter().collect();
+    if selector_token_set.is_empty() {
+        return None;
+    }
+
+    variants
+        .iter()
+        .filter_map(|variant| {
+            let variant_tokens = selector_tokens(&variant.tag);
+            if variant_tokens.is_empty()
+                || !variant_tokens
+                    .iter()
+                    .all(|token| selector_token_set.contains(token))
+            {
+                return None;
+            }
+
+            Some((variant_tokens.len(), variant.tag.len(), variant))
+        })
+        .max_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)))
+        .map(|(_, _, variant)| variant)
 }
 
 /// Resolve the full loadout tree for an entity, recursively walking
@@ -551,6 +639,8 @@ pub fn resolve_loadout_indexed(idx: &EntityIndex, record: &Record) -> LoadoutTre
             no_rotation: false,
             offset_position: [0.0; 3],
             offset_rotation: [0.0; 3],
+            detach_direction: [0.0; 3],
+            port_flags: String::new(),
             port_tags: String::new(),
             geometry_path,
             material_path,
@@ -616,6 +706,138 @@ fn extract_sub_geometry_paths(node_params: &Value) -> (Option<String>, Option<St
         .filter(|p| !p.is_empty())
         .map(|s| s.to_owned());
     (geom, mtl)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn string(value: &'static str) -> Value<'static> {
+        Value::String(value)
+    }
+
+    fn object(type_name: &'static str, fields: Vec<(&'static str, Value<'static>)>) -> Value<'static> {
+        Value::Object {
+            type_name,
+            fields,
+            record_id: None,
+        }
+    }
+
+    fn geometry_node(
+        tag: &'static str,
+        geometry_path: &'static str,
+        children: Vec<Value<'static>>,
+    ) -> Value<'static> {
+        object(
+            "SGeometryNodeParams",
+            vec![
+                (
+                    "Geometry",
+                    object(
+                        "SGeometryDataParams",
+                        vec![
+                            (
+                                "Geometry",
+                                object(
+                                    "GlobalResourceGeometry",
+                                    vec![("path", string(geometry_path))],
+                                ),
+                            ),
+                            (
+                                "Material",
+                                object("GlobalResourceMaterial", vec![("path", string(""))]),
+                            ),
+                        ],
+                    ),
+                ),
+                ("SubGeometry", Value::Array(children)),
+                ("Tags", string(tag)),
+            ],
+        )
+    }
+
+    #[test]
+    fn collect_sub_geometry_variants_flattens_nested_tags() {
+        let front = geometry_node(
+            "front",
+            "Objects/Ships/Vulture/Front_Left.cga",
+            vec![
+                geometry_node("left", "Objects/Ships/Vulture/Front_Left.cga", Vec::new()),
+                geometry_node("right", "Objects/Ships/Vulture/Front_Right.cga", Vec::new()),
+            ],
+        );
+
+        let mut variants = Vec::new();
+        collect_sub_geometry_variants(&front, &[], &mut variants);
+
+        assert!(variants.iter().any(|variant| {
+            variant.tag == "front left"
+                && variant.geometry_path == "Objects/Ships/Vulture/Front_Left.cga"
+        }));
+        assert!(variants.iter().any(|variant| {
+            variant.tag == "front right"
+                && variant.geometry_path == "Objects/Ships/Vulture/Front_Right.cga"
+        }));
+    }
+
+    #[test]
+    fn match_sub_geometry_variant_prefers_most_specific_selector() {
+        let variants = vec![
+            SubGeometryVariant {
+                tag: "front".to_string(),
+                geometry_path: "Objects/Ships/Vulture/Front_Left.cga".to_string(),
+                material_path: String::new(),
+            },
+            SubGeometryVariant {
+                tag: "front left".to_string(),
+                geometry_path: "Objects/Ships/Vulture/Front_Left.cga".to_string(),
+                material_path: String::new(),
+            },
+            SubGeometryVariant {
+                tag: "front right".to_string(),
+                geometry_path: "Objects/Ships/Vulture/Front_Right.cga".to_string(),
+                material_path: String::new(),
+            },
+            SubGeometryVariant {
+                tag: "rear".to_string(),
+                geometry_path: "Objects/Ships/Vulture/Rear.cga".to_string(),
+                material_path: String::new(),
+            },
+        ];
+
+        let matched = match_sub_geometry_variant(
+            &variants,
+            "",
+            None,
+            "hardpoint_thruster_vtol_front_right",
+        )
+        .expect("front-right hardpoint should match nested right variant");
+
+        assert_eq!(matched.tag, "front right");
+        assert_eq!(
+            matched.geometry_path,
+            "Objects/Ships/Vulture/Front_Right.cga"
+        );
+    }
+
+    #[test]
+    fn has_multiple_geometry_variants_ignores_material_only_differences() {
+        let variants = vec![
+            SubGeometryVariant {
+                tag: "brown01".to_string(),
+                geometry_path: "Objects/fps_weapons/gadgets/grin/multitool/Cutter/gdgt_fps_grin_multitool_cutter.cgf".to_string(),
+                material_path: "Objects/fps_weapons/gadgets/grin/multitool/Cutter/gdgt_fps_grin_multitool_cutter_mirage_mat.mtl".to_string(),
+            },
+            SubGeometryVariant {
+                tag: "red01".to_string(),
+                geometry_path: "Objects/fps_weapons/gadgets/grin/multitool/Cutter/gdgt_fps_grin_multitool_cutter.cgf".to_string(),
+                material_path: "Objects/fps_weapons/gadgets/grin/multitool/Cutter/gdgt_fps_grin_multitool_cutter_bloodline_mat.mtl".to_string(),
+            },
+        ];
+
+        assert!(!has_multiple_geometry_variants(&variants));
+    }
 }
 
 /// Extract the loadout from an inline EntityClassDefinition Value.
@@ -684,6 +906,8 @@ fn collect_entries_recursive(
             no_rotation: false,
             offset_position: [0.0; 3],
             offset_rotation: [0.0; 3],
+            detach_direction: [0.0; 3],
+            port_flags: String::new(),
             port_tags: String::new(),
                     geometry_path: child_geom,
                     material_path: child_mtl,
@@ -768,6 +992,8 @@ fn collect_entries_recursive(
                     no_rotation: false,
                     offset_position: [0.0; 3],
                     offset_rotation: [0.0; 3],
+                    detach_direction: [0.0; 3],
+                    port_flags: String::new(),
                     port_tags: String::new(),
                     geometry_path: ref_geom,
                     material_path: ref_mtl,
@@ -788,6 +1014,8 @@ fn collect_entries_recursive(
                     no_rotation: false,
                     offset_position: [0.0; 3],
                     offset_rotation: [0.0; 3],
+                    detach_direction: [0.0; 3],
+                    port_flags: String::new(),
                     port_tags: String::new(),
                     geometry_path: ref_geom,
                     material_path: ref_mtl,
@@ -833,6 +1061,8 @@ fn collect_entries_recursive(
             no_rotation: false,
             offset_position: [0.0; 3],
             offset_rotation: [0.0; 3],
+            detach_direction: [0.0; 3],
+            port_flags: String::new(),
             port_tags: String::new(),
                     geometry_path: ref_geom,
                     material_path: ref_mtl,

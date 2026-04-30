@@ -130,18 +130,25 @@ export interface ExportRequest {
   output_dir: string;
   lod: number;
   mip: number;
+  export_kind: string;
   material_mode: string;
   format: string;
   include_attachments: boolean;
   include_interior: boolean;
+  include_lights: boolean;
   threads: number;
+  overwrite_existing_assets: boolean;
+  include_nodraw: boolean;
+  include_animations: boolean;
 }
 
 export interface ExportProgress {
   current: number;
   total: number;
+  fraction: number;
   entity_name: string;
   entity_id: string;
+  stage: string;
   error: string | null;
 }
 

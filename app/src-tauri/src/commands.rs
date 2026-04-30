@@ -1,9 +1,11 @@
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager, State};
+use serde::Serialize;
+use tauri::{AppHandle, Emitter, State};
 
 use starbreaker_common::Progress;
 use starbreaker_datacore::types::CigGuid;
@@ -12,21 +14,11 @@ use starbreaker_p4k::MappedP4k;
 use crate::error::AppError;
 use crate::state::AppState;
 
+/// Discovery result returned to the frontend.
 #[derive(Serialize)]
 pub struct DiscoverResult {
     pub path: String,
     pub source: String,
-}
-
-#[derive(Serialize)]
-pub struct InstallRootInfo {
-    pub path: String,
-    pub source: String,
-}
-
-#[derive(Default, Deserialize, Serialize)]
-struct AppSettings {
-    install_root: Option<PathBuf>,
 }
 
 /// A directory entry returned to the frontend.
@@ -112,49 +104,14 @@ pub fn get_system_theme() -> SystemPalette {
 
 /// Discover all Data.p4k installations across channels.
 #[tauri::command]
-pub fn get_install_root(app: AppHandle) -> Result<InstallRootInfo, AppError> {
-    let (path, source) = active_install_root(&app)?;
-    Ok(InstallRootInfo {
-        path: path.to_string_lossy().into_owned(),
-        source: source.to_string(),
-    })
-}
-
-#[tauri::command]
-pub fn set_install_root(app: AppHandle, path: String) -> Result<(), AppError> {
-    let install_root = PathBuf::from(path);
-    if !install_root.is_dir() {
-        return Err(AppError::Internal(format!(
-            "install directory '{}' does not exist",
-            install_root.display()
-        )));
-    }
-
-    let settings = AppSettings {
-        install_root: Some(install_root),
-    };
-    save_settings(&app, &settings)
-}
-
-#[tauri::command]
-pub fn reset_install_root(app: AppHandle) -> Result<(), AppError> {
-    save_settings(&app, &AppSettings::default())
-}
-
-#[tauri::command]
-pub fn discover_p4k(app: AppHandle) -> Result<Vec<DiscoverResult>, AppError> {
-    if let Ok(val) = std::env::var(starbreaker_common::discover::ENV_P4K) {
-        let path = PathBuf::from(val);
-        if path.is_file() {
-            return Ok(vec![DiscoverResult {
-                path: path.to_string_lossy().into_owned(),
-                source: "env".to_string(),
-            }]);
-        }
-    }
-
-    let (root, _) = active_install_root(&app)?;
-    Ok(discover_from_root(&root))
+pub fn discover_p4k() -> Vec<DiscoverResult> {
+    starbreaker_common::discover::find_all_p4k()
+        .into_iter()
+        .map(|d| DiscoverResult {
+            path: d.path.to_string_lossy().into_owned(),
+            source: d.source,
+        })
+        .collect()
 }
 
 /// Open a P4k file and store it in managed state.
@@ -402,8 +359,10 @@ pub async fn scan_categories(state: State<'_, AppState>) -> Result<Vec<CategoryD
 pub struct ExportProgress {
     pub current: usize,
     pub total: usize,
+    pub fraction: f32,
     pub entity_name: String,
     pub entity_id: String,
+    pub stage: String,
     pub error: Option<String>,
 }
 
@@ -414,6 +373,51 @@ pub struct ExportDone {
     pub succeeded_ids: Vec<String>,
 }
 
+fn bundled_extension(format: starbreaker_3d::ExportFormat) -> &'static str {
+    match format {
+        starbreaker_3d::ExportFormat::Glb => "glb",
+        starbreaker_3d::ExportFormat::Stl => "stl",
+    }
+}
+
+fn prepare_decomposed_output_root(output_root: &Path, package_name: &str) -> Result<(), AppError> {
+    if output_root.exists() {
+        if output_root.is_file() {
+            return Err(AppError::Internal(format!(
+                "decomposed output root '{}' already exists as a file",
+                output_root.display(),
+            )));
+        }
+    }
+
+    let packages_root = output_root.join("Packages");
+    let package_root = packages_root.join(package_name);
+    if package_root.exists() {
+        std::fs::remove_dir_all(&package_root)?;
+    }
+
+    std::fs::create_dir_all(&package_root)?;
+    Ok(())
+}
+
+fn decomposed_package_directory_name(
+    files: &[starbreaker_3d::ExportedFile],
+    fallback_name: &str,
+) -> String {
+    for file in files {
+        let Some(rest) = file.relative_path.strip_prefix("Packages/") else {
+            continue;
+        };
+        let Some((package_name, _)) = rest.split_once('/') else {
+            continue;
+        };
+        if !package_name.is_empty() {
+            return package_name.to_string();
+        }
+    }
+    fallback_name.to_string()
+}
+
 #[derive(Debug, serde::Deserialize)]
 pub struct ExportRequest {
     pub record_ids: Vec<String>,
@@ -421,16 +425,186 @@ pub struct ExportRequest {
     pub output_dir: String,
     pub lod: u32,
     pub mip: u32,
+    pub export_kind: String,
     /// "none", "colors", "textures", "all"
     pub material_mode: String,
     /// "glb" or "stl"
     pub format: String,
     pub include_attachments: bool,
     pub include_interior: bool,
+    pub include_lights: bool,
     pub threads: usize,
+    pub overwrite_existing_assets: bool,
+    pub include_nodraw: bool,
+    pub include_animations: bool,
 }
 
-/// Start exporting selected entities to GLB files.
+#[derive(Clone)]
+struct ExportProgressSlot {
+    entity_name: String,
+    entity_id: String,
+    progress: Arc<Progress>,
+}
+
+#[derive(Clone, Copy)]
+enum DecomposedWriteOutcome {
+    Written,
+    SkippedExisting,
+}
+
+fn snapshot_export_progress(slots: &[ExportProgressSlot]) -> ExportProgress {
+    if slots.is_empty() {
+        return ExportProgress {
+            current: 0,
+            total: 0,
+            fraction: 1.0,
+            entity_name: String::new(),
+            entity_id: String::new(),
+            stage: String::new(),
+            error: None,
+        };
+    }
+
+    let mut completed = 0usize;
+    let mut fraction_sum = 0.0f32;
+    let mut active_name = String::new();
+    let mut active_id = String::new();
+    let mut active_stage = String::new();
+    let mut active_fraction = -1.0f32;
+    let mut fallback_name = String::new();
+    let mut fallback_id = String::new();
+    let mut fallback_stage = String::new();
+    let mut fallback_fraction = -1.0f32;
+
+    for slot in slots {
+        let (fraction, stage) = slot.progress.get();
+        fraction_sum += fraction;
+        if slot.progress.is_done() || fraction >= 0.9999 {
+            completed += 1;
+        }
+
+        let has_activity = fraction > 0.0 || !stage.is_empty();
+        if has_activity && fraction >= fallback_fraction {
+            fallback_fraction = fraction;
+            fallback_name = slot.entity_name.clone();
+            fallback_id = slot.entity_id.clone();
+            fallback_stage = stage.clone();
+        }
+
+        if fraction < 1.0 && has_activity && fraction >= active_fraction {
+            active_fraction = fraction;
+            active_name = slot.entity_name.clone();
+            active_id = slot.entity_id.clone();
+            active_stage = stage;
+        }
+    }
+
+    if active_name.is_empty() {
+        active_name = fallback_name;
+        active_id = fallback_id;
+        active_stage = fallback_stage;
+    }
+
+    ExportProgress {
+        current: completed,
+        total: slots.len(),
+        fraction: (fraction_sum / slots.len() as f32).clamp(0.0, 1.0),
+        entity_name: active_name,
+        entity_id: active_id,
+        stage: active_stage,
+        error: None,
+    }
+}
+
+async fn emit_export_progress_until_done(
+    app: AppHandle,
+    slots: Vec<ExportProgressSlot>,
+    done: Arc<AtomicBool>,
+) {
+    loop {
+        let _ = app.emit("export-progress", snapshot_export_progress(&slots));
+        if done.load(Ordering::Relaxed) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn should_skip_existing_decomposed_asset(
+    file: &starbreaker_3d::ExportedFile,
+    overwrite_existing_assets: bool,
+) -> bool {
+    !overwrite_existing_assets && file.kind.is_mesh_or_texture_asset()
+}
+
+fn write_decomposed_file(
+    file: &starbreaker_3d::ExportedFile,
+    file_path: &Path,
+    overwrite_existing_assets: bool,
+) -> Result<DecomposedWriteOutcome, AppError> {
+    if file_path.exists() {
+        if !file_path.is_file() {
+            return Err(AppError::Internal(format!(
+                "decomposed output path '{}' already exists as a directory",
+                file_path.display(),
+            )));
+        }
+        if should_skip_existing_decomposed_asset(file, overwrite_existing_assets) {
+            return Ok(DecomposedWriteOutcome::SkippedExisting);
+        }
+    }
+
+    std::fs::write(file_path, &file.bytes)?;
+    Ok(DecomposedWriteOutcome::Written)
+}
+
+fn collect_existing_decomposed_assets(output_root: &Path) -> Result<HashSet<String>, AppError> {
+    let data_root = output_root.join("Data");
+    let mut existing = HashSet::new();
+    if !data_root.exists() {
+        return Ok(existing);
+    }
+
+    let mut pending = vec![data_root];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+
+            let Some(extension) = path.extension().and_then(|ext| ext.to_str()) else {
+                continue;
+            };
+            if !matches!(extension, "glb" | "png") {
+                continue;
+            }
+
+            let relative = path
+                .strip_prefix(output_root)
+                .map_err(|_| {
+                    AppError::Internal(format!(
+                        "failed to compute relative decomposed asset path for '{}'",
+                        path.display(),
+                    ))
+                })?
+                .to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_lowercase();
+            existing.insert(relative);
+        }
+    }
+
+    Ok(existing)
+}
+
+/// Start exporting selected entities to bundled files.
 #[tauri::command]
 pub async fn start_export(
     app: AppHandle,
@@ -463,43 +637,87 @@ pub async fn start_export(
         .iter()
         .map(|s| s.parse::<CigGuid>())
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    let id_strings: Vec<String> = record_ids.iter().map(|id| id.to_string()).collect();
+    let export_names: Vec<String> = request
+        .names
+        .iter()
+        .map(|name| sanitize_export_name(&export_entity_name(name)))
+        .collect();
+    let progress_slots: Vec<ExportProgressSlot> = export_names
+        .iter()
+        .zip(id_strings.iter())
+        .map(|(entity_name, entity_id)| ExportProgressSlot {
+            entity_name: entity_name.clone(),
+            entity_id: entity_id.clone(),
+            progress: Arc::new(Progress::new()),
+        })
+        .collect();
+    let progress_done = Arc::new(AtomicBool::new(false));
+
+    tauri::async_runtime::spawn(emit_export_progress_until_done(
+        app.clone(),
+        progress_slots.clone(),
+        progress_done.clone(),
+    ));
 
     let material_mode = match request.material_mode.to_lowercase().as_str() {
-        "none" => starbreaker_gltf::MaterialMode::None,
-        "colors" => starbreaker_gltf::MaterialMode::Colors,
-        "all" => starbreaker_gltf::MaterialMode::All,
-        _ => starbreaker_gltf::MaterialMode::Textures,
+        "none" => starbreaker_3d::MaterialMode::None,
+        "colors" => starbreaker_3d::MaterialMode::Colors,
+        "all" => starbreaker_3d::MaterialMode::All,
+        _ => starbreaker_3d::MaterialMode::Textures,
+    };
+    let kind = match request.export_kind.to_lowercase().as_str() {
+        "decomposed" => starbreaker_3d::ExportKind::Decomposed,
+        _ => starbreaker_3d::ExportKind::Bundled,
     };
     let format = match request.format.to_lowercase().as_str() {
-        "stl" => starbreaker_gltf::ExportFormat::Stl,
-        _ => starbreaker_gltf::ExportFormat::Glb,
+        "stl" => starbreaker_3d::ExportFormat::Stl,
+        _ => starbreaker_3d::ExportFormat::Glb,
     };
-    let opts = starbreaker_gltf::ExportOptions {
+    let existing_asset_paths = if kind == starbreaker_3d::ExportKind::Decomposed
+        && !request.overwrite_existing_assets
+    {
+        Arc::new(collect_existing_decomposed_assets(Path::new(&request.output_dir))?)
+    } else {
+        Arc::new(HashSet::new())
+    };
+    let opts = starbreaker_3d::ExportOptions {
+        kind,
         format,
         material_mode,
         include_attachments: request.include_attachments,
         include_interior: request.include_interior,
+        include_lights: request.include_lights,
+        include_nodraw: request.include_nodraw,
+        include_shields: false,
         texture_mip: request.mip,
         lod_level: request.lod,
+        include_animations: request.include_animations,
+        apply_default_animation_pose: !request.include_animations,
+        default_animation_tags: vec!["landing_gear_extend".to_string()],
     };
 
     log::info!(
-        "[export] material_mode={:?} format={:?} include_interior={} include_attachments={} lod={} mip={}",
+        "[export] material_mode={:?} format={:?} include_interior={} include_attachments={} include_lights={} include_nodraw={} lod={} mip={}",
         opts.material_mode,
         opts.format,
         opts.include_interior,
         opts.include_attachments,
+        opts.include_lights,
+        opts.include_nodraw,
         opts.lod_level,
         opts.texture_mip
     );
 
-    let names = request.names;
     let output_dir = request.output_dir;
+    let requested_threads = request.threads;
+    let overwrite_existing_assets = request.overwrite_existing_assets;
 
     tokio::task::spawn_blocking(move || {
         let db = match starbreaker_datacore::database::Database::from_bytes(&dcb_bytes) {
             Ok(db) => db,
             Err(_) => {
+                progress_done.store(true, Ordering::Relaxed);
                 let _ = app.emit(
                     "export-done",
                     ExportDone {
@@ -515,15 +733,11 @@ pub async fn start_export(
         let total = record_ids.len();
         let success = AtomicUsize::new(0);
         let errors = AtomicUsize::new(0);
-        let completed = AtomicUsize::new(0);
         let succeeded_ids: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
-        // Build string IDs upfront for event payloads.
-        let id_strings: Vec<String> = record_ids.iter().map(|id| id.to_string()).collect();
-
         // 0 = auto (half cores), otherwise use the requested count.
-        let num_threads = if request.threads > 0 {
-            request.threads
+        let num_threads = if requested_threads > 0 {
+            requested_threads
         } else {
             (std::thread::available_parallelism()
                 .map(|n| n.get())
@@ -537,6 +751,7 @@ pub async fn start_export(
         {
             Ok(pool) => pool,
             Err(e) => {
+                progress_done.store(true, Ordering::Relaxed);
                 let _ = app.emit(
                     "export-done",
                     ExportDone {
@@ -554,49 +769,61 @@ pub async fn start_export(
             use rayon::prelude::*;
             record_ids
                 .par_iter()
-                .zip(names.par_iter())
+                .zip(export_names.par_iter())
                 .zip(id_strings.par_iter())
-                .for_each(|((record_id, name), id_str)| {
+                .zip(progress_slots.par_iter())
+                .for_each(|(((record_id, export_name), id_str), progress_slot)| {
                     if cancel.load(Ordering::Relaxed) {
                         return;
                     }
 
-                    let i = completed.fetch_add(1, Ordering::Relaxed);
-                    let _ = app.emit(
-                        "export-progress",
-                        ExportProgress {
-                            current: i + 1,
-                            total,
-                            entity_name: name.clone(),
-                            entity_id: id_str.clone(),
-                            error: None,
-                        },
+                    progress_slot.progress.report(0.01, "Resolving loadout");
+
+                    let filename = format!(
+                        "{}.{}",
+                        sanitize_filename(export_name),
+                        bundled_extension(opts.format),
                     );
+                    let output_path = match opts.kind {
+                        starbreaker_3d::ExportKind::Bundled => {
+                            std::path::PathBuf::from(&output_dir).join(&filename)
+                        }
+                        starbreaker_3d::ExportKind::Decomposed => std::path::PathBuf::from(&output_dir),
+                    };
 
-                    let filename = format!("{}.glb", sanitize_filename(name));
-                    let output_path = std::path::PathBuf::from(&output_dir).join(&filename);
-
-                    match export_single(&db, &p4k, record_id, &output_path, &opts) {
+                    match export_single(
+                        &db,
+                        &p4k,
+                        record_id,
+                        &output_path,
+                        &opts,
+                        export_name,
+                        overwrite_existing_assets,
+                        Some(progress_slot.progress.as_ref()),
+                        Some(existing_asset_paths.as_ref()),
+                    ) {
                         Ok(()) => {
                             success.fetch_add(1, Ordering::Relaxed);
                             succeeded_ids.lock().unwrap().push(id_str.clone());
                         }
                         Err(e) => {
+                            progress_slot.progress.report(1.0, "Failed");
+                            let mut snapshot = snapshot_export_progress(&progress_slots);
+                            snapshot.entity_name = export_name.clone();
+                            snapshot.entity_id = id_str.clone();
+                            snapshot.stage = "Failed".to_string();
+                            snapshot.error = Some(format!("{export_name}: {e}"));
                             let _ = app.emit(
                                 "export-progress",
-                                ExportProgress {
-                                    current: i + 1,
-                                    total,
-                                    entity_name: name.clone(),
-                                    entity_id: id_str.clone(),
-                                    error: Some(format!("{name}: {e}")),
-                                },
+                                snapshot,
                             );
                             errors.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 });
         }); // pool.install
+
+        progress_done.store(true, Ordering::Relaxed);
 
         let _ = app.emit(
             "export-done",
@@ -617,22 +844,109 @@ pub fn cancel_export(state: State<'_, AppState>) {
     state.export_cancel.store(true, Ordering::SeqCst);
 }
 
-/// Export a single entity to a GLB file.
+/// Export a single entity to a bundled file.
 fn export_single(
     db: &starbreaker_datacore::database::Database,
     p4k: &MappedP4k,
     record_id: &CigGuid,
     output_path: &Path,
-    opts: &starbreaker_gltf::ExportOptions,
+    opts: &starbreaker_3d::ExportOptions,
+    export_name: &str,
+    overwrite_existing_assets: bool,
+    progress: Option<&Progress>,
+    existing_asset_paths: Option<&HashSet<String>>,
 ) -> Result<(), AppError> {
     let record = db
         .record_by_id(record_id)
         .ok_or_else(|| AppError::Internal("record not found".into()))?;
     let idx = starbreaker_datacore::loadout::EntityIndex::new(db);
     let tree = starbreaker_datacore::loadout::resolve_loadout_indexed(&idx, record);
-    let result = starbreaker_gltf::assemble_glb_with_loadout(db, p4k, record, &tree, opts)?;
-    std::fs::write(output_path, &result.glb)?;
+    let result = starbreaker_3d::assemble_glb_with_loadout_with_progress(
+        db,
+        p4k,
+        record,
+        &tree,
+        opts,
+        progress,
+        existing_asset_paths,
+    )?;
+    match result.kind {
+        starbreaker_3d::ExportKind::Bundled => {
+            let bundled_bytes = result.bundled_bytes().ok_or_else(|| {
+                AppError::Internal(format!(
+                    "export returned non-bundled output for {:?}",
+                    result.kind,
+                ))
+            })?;
+            if let Some(progress) = progress {
+                progress.report(0.95, "Writing bundled file");
+            }
+            std::fs::write(output_path, bundled_bytes)?;
+            if let Some(progress) = progress {
+                progress.report(1.0, "Done");
+            }
+        }
+        starbreaker_3d::ExportKind::Decomposed => {
+            let decomposed = result.decomposed.as_ref().ok_or_else(|| {
+                AppError::Internal("export returned no decomposed files".into())
+            })?;
+            let package_name = decomposed_package_directory_name(&decomposed.files, export_name);
+            prepare_decomposed_output_root(output_path, &package_name)?;
+            let total_files = decomposed.files.len().max(1);
+            for (index, file) in decomposed.files.iter().enumerate() {
+                let file_path = output_path.join(&file.relative_path);
+                if let Some(parent) = file_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let outcome = write_decomposed_file(file, &file_path, overwrite_existing_assets)?;
+                if let Some(progress) = progress {
+                    let fraction = (index + 1) as f32 / total_files as f32;
+                    let stage = match outcome {
+                        DecomposedWriteOutcome::Written => "Writing package files",
+                        DecomposedWriteOutcome::SkippedExisting => "Skipping existing assets",
+                    };
+                    progress.report(0.90 + 0.10 * fraction, stage);
+                }
+            }
+            if let Some(progress) = progress {
+                progress.report(1.0, "Done");
+            }
+        }
+    }
     Ok(())
+}
+
+fn export_entity_name(name: &str) -> String {
+    let trimmed = name.trim_matches('"');
+    trimmed
+        .rsplit('.')
+        .next()
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
+fn sanitize_export_name(name: &str) -> String {
+    let mut cleaned = String::new();
+    let mut last_was_space = false;
+
+    for ch in name.chars() {
+        if ch.is_alphanumeric() {
+            cleaned.push(ch);
+            last_was_space = false;
+        } else if ch.is_whitespace() || matches!(ch, '_' | '-') {
+            if !cleaned.is_empty() && !last_was_space {
+                cleaned.push(' ');
+                last_was_space = true;
+            }
+        }
+    }
+
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        "Export".to_string()
+    } else {
+        cleaned.to_string()
+    }
 }
 
 /// Sanitize a filename by replacing invalid characters with underscores.
@@ -643,6 +957,85 @@ fn sanitize_filename(name: &str) -> String {
             _ => c,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        decomposed_package_directory_name, export_entity_name, sanitize_export_name,
+        should_skip_existing_decomposed_asset,
+    };
+
+    #[test]
+    fn export_entity_name_strips_record_prefix_and_quotes() {
+        assert_eq!(export_entity_name("EntityClassDefinition.ARGO_MOLE\""), "ARGO_MOLE");
+        assert_eq!(export_entity_name("ARGO_MOLE"), "ARGO_MOLE");
+    }
+
+    #[test]
+    fn sanitize_export_name_preserves_alphanumerics_and_spaces() {
+        assert_eq!(sanitize_export_name("Argo Mole Teach's Special"), "Argo Mole Teachs Special");
+        assert_eq!(sanitize_export_name("ARGO_MOLE"), "ARGO MOLE");
+    }
+
+    #[test]
+    fn decomposed_package_directory_name_preserves_exporter_suffixes() {
+        let files = vec![
+            starbreaker_3d::ExportedFile {
+                relative_path: "Packages/ARGO MOLE_LOD0_TEX0/scene.json".into(),
+                bytes: Vec::new(),
+                kind: starbreaker_3d::ExportedFileKind::PackageManifest,
+            },
+            starbreaker_3d::ExportedFile {
+                relative_path: "Data/Objects/Test/root.glb".into(),
+                bytes: Vec::new(),
+                kind: starbreaker_3d::ExportedFileKind::MeshAsset,
+            },
+        ];
+
+        assert_eq!(
+            decomposed_package_directory_name(&files, "Argo Mole"),
+            "ARGO MOLE_LOD0_TEX0"
+        );
+    }
+
+    #[test]
+    fn decomposed_package_directory_name_falls_back_when_packages_path_is_absent() {
+        let files = vec![starbreaker_3d::ExportedFile {
+            relative_path: "Data/Objects/Test/root.glb".into(),
+            bytes: Vec::new(),
+            kind: starbreaker_3d::ExportedFileKind::MeshAsset,
+        }];
+
+        assert_eq!(
+            decomposed_package_directory_name(&files, "Argo Mole"),
+            "Argo Mole"
+        );
+    }
+
+    #[test]
+    fn skip_existing_assets_only_applies_to_meshes_and_textures() {
+        let mesh = starbreaker_3d::ExportedFile {
+            relative_path: "Data/Objects/Test/root.glb".into(),
+            bytes: Vec::new(),
+            kind: starbreaker_3d::ExportedFileKind::MeshAsset,
+        };
+        let texture = starbreaker_3d::ExportedFile {
+            relative_path: "Data/Objects/Test/root.png".into(),
+            bytes: Vec::new(),
+            kind: starbreaker_3d::ExportedFileKind::TextureAsset,
+        };
+        let material = starbreaker_3d::ExportedFile {
+            relative_path: "Data/Objects/Test/root.materials.json".into(),
+            bytes: Vec::new(),
+            kind: starbreaker_3d::ExportedFileKind::MaterialSidecar,
+        };
+
+        assert!(should_skip_existing_decomposed_asset(&mesh, false));
+        assert!(should_skip_existing_decomposed_asset(&texture, false));
+        assert!(!should_skip_existing_decomposed_asset(&material, false));
+        assert!(!should_skip_existing_decomposed_asset(&mesh, true));
+    }
 }
 
 /// Generate a GLB preview for a geometry file in the P4K.
@@ -660,20 +1053,24 @@ pub fn preview_geometry(
         .ok_or_else(|| AppError::Internal("P4K not loaded".into()))?
         .clone();
 
-    // Resolve companion: .skinm -> .skin, .cgfm -> .cgf
-    let primary = if path.ends_with('m') && (path.ends_with(".skinm") || path.ends_with(".cgfm")) {
+    // Resolve companion: .skinm -> .skin, .cgfm -> .cgf, .cgam -> .cga
+    let primary = if path.ends_with('m') && (path.ends_with(".skinm") || path.ends_with(".cgfm") || path.ends_with(".cgam")) {
         path[..path.len() - 1].to_string()
     } else {
         path.clone()
     };
 
-    // Try reading the companion file first (has vertex data), fall back to primary
+    // Read companion file (vertex data) — fall back to primary if no companion exists
     let companion = format!("{primary}m");
     let data = p4k
         .read_file(&companion)
         .or_else(|_| p4k.read_file(&primary))?;
 
-    let glb = starbreaker_gltf::skin_to_glb(&data)?;
+    // Read primary file for NMC transforms (scene graph hierarchy).
+    // The NMC chunk lives in the .cgf/.skin/.cga, not the companion .cgfm/.skinm/.cgam.
+    let metadata = p4k.read_file(&primary).ok();
+
+    let glb = starbreaker_3d::skin_to_glb(&data, metadata.as_deref())?;
     Ok(glb)
 }
 
