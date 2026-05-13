@@ -104,39 +104,45 @@ impl<'a> CryXml<'a> {
 
         let _ = write!(buf, "{indent}<{tag}");
 
-        // Write attributes.
         let attr_start = node.first_attribute_index as usize;
         let attr_count = node.attribute_count as usize;
         for attr in &self.attributes[attr_start..attr_start + attr_count] {
             let key = self.get_string(attr.key_string_offset);
             let val = self.get_string(attr.value_string_offset);
-            let _ = write!(buf, " {key}=\"{}\"", escape_xml_attr(val));
+            if val.is_empty() {
+                let _ = write!(buf, " {key}=\"empty\"");
+            } else {
+                let _ = write!(buf, " {key}=\"{}\"", escape_xml_attr(val));
+            }
         }
 
         let child_start = node.first_child_index as usize;
         let child_count = node.child_count as usize;
 
         if child_count == 0 {
-            buf.push_str(" />\n");
+            buf.push_str(" />\r\n");
         } else {
-            buf.push_str(">\n");
+            buf.push_str(">\r\n");
             for &child_idx in &self.child_indices[child_start..child_start + child_count] {
                 self.write_node(buf, child_idx as usize, depth + 1);
             }
-            let _ = writeln!(buf, "{indent}</{tag}>");
+            let _ = write!(buf, "{indent}</{tag}>\r\n");
         }
     }
 }
 
 impl fmt::Display for CryXml<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut buf = String::new();
+        let mut buf = String::with_capacity(256);
+        buf.push_str("<?xml version=\"1.0\" encoding=\"utf-16\"?>\r\n");
         self.write_node(&mut buf, 0, 0);
+        if buf.ends_with("\r\n") {
+            buf.truncate(buf.len() - 2);
+        }
         f.write_str(&buf)
     }
 }
 
-/// Escape the five XML-special characters inside attribute values.
 fn escape_xml_attr(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -145,7 +151,6 @@ fn escape_xml_attr(s: &str) -> String {
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&apos;"),
             other => out.push(other),
         }
     }

@@ -3,6 +3,7 @@ mod common;
 mod cryxml;
 mod dcb;
 mod dds;
+mod diff;
 mod entity;
 mod error;
 mod glb;
@@ -142,6 +143,7 @@ enum Command {
         #[command(subcommand)]
         command: nmc::NmcCommand,
     },
+    Diff(diff::DiffArgs),
 }
 
 fn main() {
@@ -174,6 +176,7 @@ fn main() {
         Command::Chf { command } => command.run(),
         Command::Wwise { command } => command.run(),
         Command::Nmc { command } => command.run(),
+        Command::Diff(args) => args.run(),
     };
 
     if let Err(e) = result {

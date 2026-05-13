@@ -1,3 +1,4 @@
+pub mod dataforge_xml;
 pub mod json;
 pub mod unp4k_xml;
 pub mod xml;
@@ -45,6 +46,18 @@ pub fn write_json_compact(
 /// Export a record to unp4k-compatible XML bytes.
 pub fn to_unp4k_xml(db: &Database, record: &Record) -> Result<Vec<u8>, ExportError> {
     unp4k_xml::to_unp4k_xml(db, record)
+}
+
+pub fn to_dataforge_xml(db: &Database, record: &Record) -> Result<Vec<u8>, ExportError> {
+    dataforge_xml::to_dataforge_xml(db, record, true)
+}
+
+pub fn write_dataforge_xml(
+    db: &Database,
+    record: &Record,
+    w: &mut Vec<u8>,
+) -> Result<(), ExportError> {
+    dataforge_xml::write_dataforge_xml(db, record, true, w)
 }
 
 /// Export a record to XML bytes (pretty-printed).

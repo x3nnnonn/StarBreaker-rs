@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -14,6 +14,7 @@ pub enum DcbFormat {
     Json,
     Xml,
     Unp4k,
+    DataForge,
 }
 
 #[derive(Subcommand)]
@@ -86,7 +87,7 @@ impl DcbCommand {
     }
 }
 
-fn extract(
+pub(crate) fn extract(
     p4k_path: Option<PathBuf>,
     dcb_path: Option<PathBuf>,
     output: PathBuf,
@@ -100,7 +101,7 @@ fn extract(
 
     let ext = match format {
         DcbFormat::Json => "json",
-        DcbFormat::Xml | DcbFormat::Unp4k => "xml",
+        DcbFormat::Xml | DcbFormat::Unp4k | DcbFormat::DataForge => "xml",
     };
 
     // Only export main records (matching C#'s behavior), using the file path
@@ -127,37 +128,53 @@ fn extract(
 
     std::fs::create_dir_all(&output)?;
 
-    records.par_iter().for_each(|record| {
-        let file_name = db.resolve_string(record.file_name_offset);
-        // Change extension to match output format (C# uses Path.ChangeExtension)
-        let out_name = match file_name.rfind('.') {
-            Some(dot) => format!("{}.{ext}", &file_name[..dot]),
-            None => format!("{file_name}.{ext}"),
-        };
-        let out_path = output.join(&out_name);
+    let out_paths: Vec<PathBuf> = records
+        .iter()
+        .map(|record| {
+            let file_name = db.resolve_string(record.file_name_offset);
+            let out_name = match file_name.rfind('.') {
+                Some(dot) => format!("{}.{ext}", &file_name[..dot]),
+                None => format!("{file_name}.{ext}"),
+            };
+            output.join(&out_name)
+        })
+        .collect();
 
-        if let Some(parent) = out_path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                eprintln!("[ERR] create dir {}: {e}", parent.display());
-            }
+    let mut unique_parents: std::collections::HashSet<&Path> =
+        std::collections::HashSet::with_capacity(1024);
+    for p in &out_paths {
+        if let Some(parent) = p.parent() {
+            unique_parents.insert(parent);
         }
+    }
+    let parents: Vec<&Path> = unique_parents.into_iter().collect();
+    parents.par_iter().try_for_each(|p| -> Result<()> {
+        std::fs::create_dir_all(p)?;
+        Ok(())
+    })?;
 
-        let result = match format {
-            DcbFormat::Json => starbreaker_datacore::export::to_json(&db, record),
-            DcbFormat::Unp4k => starbreaker_datacore::export::to_unp4k_xml(&db, record),
-            DcbFormat::Xml => starbreaker_datacore::export::to_xml(&db, record),
-        };
+    records
+        .par_iter()
+        .zip(out_paths.par_iter())
+        .for_each(|(record, out_path)| {
+            let file_name = db.resolve_string(record.file_name_offset);
+            let result = match format {
+                DcbFormat::Json => starbreaker_datacore::export::to_json(&db, record),
+                DcbFormat::Unp4k => starbreaker_datacore::export::to_unp4k_xml(&db, record),
+                DcbFormat::Xml => starbreaker_datacore::export::to_xml(&db, record),
+                DcbFormat::DataForge => starbreaker_datacore::export::to_dataforge_xml(&db, record),
+            };
 
-        match result {
-            Ok(data) => {
-                if let Err(e) = std::fs::write(&out_path, &data) {
-                    eprintln!("Error writing {out_name}: {e}");
+            match result {
+                Ok(data) => {
+                    if let Err(e) = std::fs::write(out_path, &data) {
+                        eprintln!("Error writing {}: {e}", out_path.display());
+                    }
                 }
+                Err(e) => eprintln!("Error exporting {file_name}: {e}"),
             }
-            Err(e) => eprintln!("Error exporting {file_name}: {e}"),
-        }
-        pb.inc(1);
-    });
+            pb.inc(1);
+        });
 
     pb.finish_and_clear();
     eprintln!("Done.");
