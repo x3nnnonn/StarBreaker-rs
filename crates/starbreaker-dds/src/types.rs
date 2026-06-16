@@ -65,6 +65,7 @@ pub enum DxgiFormat {
     BC5Unorm,
     BC5Snorm,
     BC6hUf16,
+    BC6hSf16,
     BC7Unorm,
     BC7UnormSrgb,
 }
@@ -82,6 +83,7 @@ impl DxgiFormat {
             83 => Some(Self::BC5Unorm),
             84 => Some(Self::BC5Snorm),
             95 => Some(Self::BC6hUf16),
+            96 => Some(Self::BC6hSf16),
             98 => Some(Self::BC7Unorm),
             99 => Some(Self::BC7UnormSrgb),
             _ => None,
@@ -113,6 +115,7 @@ impl DxgiFormat {
             | Self::BC5Unorm
             | Self::BC5Snorm
             | Self::BC6hUf16
+            | Self::BC6hSf16
             | Self::BC7Unorm
             | Self::BC7UnormSrgb => 16,
         }

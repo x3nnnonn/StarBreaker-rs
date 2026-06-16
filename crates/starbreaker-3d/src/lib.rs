@@ -2,7 +2,7 @@ pub mod dequant;
 pub(crate) mod decomposed;
 pub mod error;
 pub(crate) mod gltf;
-pub(crate) mod included_objects;
+pub mod included_objects;
 pub mod ivo;
 pub mod mtl;
 pub mod nmc;

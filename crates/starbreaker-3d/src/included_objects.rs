@@ -188,6 +188,64 @@ impl IncludedObjects {
             objects,
         })
     }
+
+    pub fn format_text(&self) -> String {
+        let placements: Vec<(&str, &IncludedObject)> = self
+            .objects
+            .iter()
+            .filter_map(|obj| {
+                self.cgf_paths
+                    .get(obj.cgf_index as usize)
+                    .map(|cgf| (cgf.as_str(), obj))
+            })
+            .collect();
+
+        let mut sb = String::new();
+        sb.push_str("# IncludedObjects\n");
+        sb.push_str(&format!(
+            "# Cgfs: {}, Materials: {}, Palettes: {}, Placements: {}\n\n",
+            self.cgf_paths.len(),
+            self.material_paths.len(),
+            self.tint_palette_paths.len(),
+            placements.len(),
+        ));
+
+        sb.push_str("[CGFs]\n");
+        for (i, cgf) in self.cgf_paths.iter().enumerate() {
+            sb.push_str(&format!("  {i:5}: {cgf}\n"));
+        }
+
+        if !self.material_paths.is_empty() {
+            sb.push_str("\n[Materials]\n");
+            for (i, mat) in self.material_paths.iter().enumerate() {
+                sb.push_str(&format!("  {i:5}: {mat}\n"));
+            }
+        }
+
+        if !self.tint_palette_paths.is_empty() {
+            sb.push_str("\n[Palettes]\n");
+            for (i, palette) in self.tint_palette_paths.iter().enumerate() {
+                sb.push_str(&format!("  {i:5}: {palette}\n"));
+            }
+        }
+
+        sb.push_str("\n[Placements]\n");
+        for (i, (cgf, obj)) in placements.iter().enumerate() {
+            sb.push_str(&format!("  #{i} {cgf}\n"));
+            for row in 0..3 {
+                sb.push_str("    [");
+                for col in 0..4 {
+                    if col > 0 {
+                        sb.push_str(", ");
+                    }
+                    sb.push_str(&format!("{:.17}", obj.transform[col][row]));
+                }
+                sb.push_str("]\n");
+            }
+        }
+
+        sb
+    }
 }
 
 fn read_u32(data: &[u8], off: &mut usize) -> Result<u32, ParseError> {

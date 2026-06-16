@@ -37,13 +37,37 @@ pub struct DiffArgs {
     pub keep: bool,
     #[arg(long, short = 'f', value_enum, default_value = "xml", env = "TEXT_FORMAT")]
     pub format: ManifestFormat,
+    #[arg(long, env = "EXTRACT_DDS")]
+    pub extract_dds: bool,
+    #[arg(
+        long,
+        env = "DIFF_AGAINST",
+        help = "Previous P4K file or diff output directory; enables new SOCPAK list and (with --extract-dds) texture diff"
+    )]
+    pub diff_against: Option<PathBuf>,
+    #[arg(long)]
+    pub dds_only: bool,
 }
 
 impl DiffArgs {
     pub fn run(self) -> Result<()> {
-        let DiffArgs { game, output, keep, format } = self;
+        let DiffArgs {
+            game,
+            output,
+            keep,
+            format,
+            extract_dds,
+            diff_against,
+            dds_only,
+        } = self;
 
-        if !keep {
+        if dds_only && !extract_dds {
+            return Err(CliError::InvalidInput(
+                "--dds-only requires --extract-dds".into(),
+            ));
+        }
+
+        if !keep && !dds_only {
             timed("Clear old output", || clear_old(&output))?;
         }
         let total = Instant::now();
@@ -51,6 +75,25 @@ impl DiffArgs {
         let p4k_path = game.join("Data.p4k");
         let exe_path = game.join("Bin64").join("StarCitizen.exe");
         let p4k = load_p4k(Some(&p4k_path))?;
+
+        if dds_only {
+            if !keep {
+                let dds_dir = output.join("DDS_Files");
+                if dds_dir.exists() {
+                    parallel_remove_dir_all(&dds_dir)?;
+                }
+            }
+            timed("DDS extraction", || {
+                crate::diff_dds::extract_dds_files(
+                    &p4k,
+                    &output.join("DDS_Files"),
+                    diff_against.as_deref(),
+                )
+            })?;
+            eprintln!("[DONE] total: {:.1}s", total.elapsed().as_secs_f64());
+            return Ok(());
+        }
+
         let p4kcontents_dir = output.join("P4kContents");
 
         timed("P4k manifest", || dump_p4k_manifest(&p4k, &output.join("P4k"), format))?;
@@ -68,6 +111,24 @@ impl DiffArgs {
                 None,
             )
         })?;
+
+        timed("P4k XML/SOC contents", || {
+            crate::diff_p4k_contents::extract_p4k_xml_files(&p4k, &p4kcontents_dir)
+        })?;
+
+        if extract_dds {
+            timed("DDS extraction", || {
+                crate::diff_dds::extract_dds_files(
+                    &p4k,
+                    &output.join("DDS_Files"),
+                    diff_against.as_deref(),
+                )
+            })?;
+        }
+
+        if let Some(against) = diff_against.as_deref() {
+            timed("New SOCPAK list", || write_new_socpak_list(&p4k, against, &output))?;
+        }
 
         let (_p4k_for_dcb, dcb_bytes) = crate::common::load_dcb_bytes(Some(&p4k_path), None)?;
         let db = starbreaker_datacore::database::Database::from_bytes(&dcb_bytes)?;
@@ -95,6 +156,23 @@ impl DiffArgs {
         eprintln!("[DONE] total: {:.1}s", total.elapsed().as_secs_f64());
         Ok(())
     }
+}
+
+fn write_new_socpak_list(
+    current: &MappedP4k,
+    diff_against: &Path,
+    output: &Path,
+) -> Result<()> {
+    let previous_path = crate::p4k_compare::resolve_previous_p4k_path(diff_against);
+    if !previous_path.is_file() {
+        return Err(CliError::NotFound(format!(
+            "previous P4K not found at {}",
+            previous_path.display()
+        )));
+    }
+    let previous = MappedP4k::open(&previous_path)?;
+    crate::p4k_compare::write_added_socpak_list(current, &previous, output)?;
+    Ok(())
 }
 
 fn timed<F: FnOnce() -> Result<()>>(label: &str, f: F) -> Result<()> {
@@ -130,8 +208,20 @@ fn parallel_remove_dir_all(path: &Path) -> Result<()> {
 }
 
 fn clear_old(output: &Path) -> Result<()> {
-    let folders = ["DataCore", "DataCoreTypes", "DataCoreEnums", "P4k", "P4kContents"];
-    let files = ["build_manifest.json", "DataCore.dcb.zst", "StarCitizen.exe.zst"];
+    let folders = [
+        "DataCore",
+        "DataCoreTypes",
+        "DataCoreEnums",
+        "P4k",
+        "P4kContents",
+        "DDS_Files",
+    ];
+    let files = [
+        "build_manifest.json",
+        "DataCore.dcb.zst",
+        "StarCitizen.exe.zst",
+        "New_SOCPAK_Files.txt",
+    ];
 
     folders.par_iter().try_for_each(|name| -> Result<()> {
         let p = output.join(name);
@@ -400,11 +490,18 @@ fn extract_tag_database(p4k: &MappedP4k, output: &Path) -> Result<()> {
 
     if starbreaker_cryxml::is_cryxmlb(&bytes) {
         match starbreaker_cryxml::from_bytes(&bytes) {
-            Ok(xml) => std::fs::write(&out_path, format!("{xml}").as_bytes())?,
-            Err(_) => std::fs::write(&out_path, &bytes)?,
+            Ok(xml) => {
+                let out = crate::diff_p4k_contents::text_to_crlf_bytes(format!("{xml}").as_bytes());
+                std::fs::write(&out_path, &out)?;
+            }
+            Err(_) => {
+                let out = crate::diff_p4k_contents::text_to_crlf_bytes(&bytes);
+                std::fs::write(&out_path, &out)?;
+            }
         }
     } else {
-        std::fs::write(&out_path, &bytes)?;
+        let out = crate::diff_p4k_contents::text_to_crlf_bytes(&bytes);
+        std::fs::write(&out_path, &out)?;
     }
     Ok(())
 }

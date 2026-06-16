@@ -274,7 +274,10 @@ impl DdsFile {
         }
 
         let format = resolve_format(pf, self.dxt10_header.as_ref())?;
-        let is_snorm = matches!(format, DxgiFormat::BC4Snorm | DxgiFormat::BC5Snorm);
+        let is_snorm = matches!(
+            format,
+            DxgiFormat::BC4Snorm | DxgiFormat::BC5Snorm | DxgiFormat::BC6hSf16
+        );
         let block_format = dxgi_to_block_format(format)?;
 
         decode_block_compressed(data, w, h, block_format, is_snorm)
@@ -432,7 +435,7 @@ fn dxgi_to_block_format(format: DxgiFormat) -> Result<BlockFormat, DdsError> {
         DxgiFormat::BC3Unorm | DxgiFormat::BC3UnormSrgb => Ok(BlockFormat::BC3),
         DxgiFormat::BC4Unorm | DxgiFormat::BC4Snorm => Ok(BlockFormat::BC4),
         DxgiFormat::BC5Unorm | DxgiFormat::BC5Snorm => Ok(BlockFormat::BC5),
-        DxgiFormat::BC6hUf16 => Ok(BlockFormat::BC6H),
+        DxgiFormat::BC6hUf16 | DxgiFormat::BC6hSf16 => Ok(BlockFormat::BC6H),
         DxgiFormat::BC7Unorm | DxgiFormat::BC7UnormSrgb => Ok(BlockFormat::BC7),
     }
 }

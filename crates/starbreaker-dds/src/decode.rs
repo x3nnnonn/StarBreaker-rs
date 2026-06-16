@@ -27,9 +27,7 @@ pub fn decode_block_compressed(
         BlockFormat::BC3 => decode_4bpp(data, width, height, bcdec_rs::bc3),
         BlockFormat::BC4 => decode_bc4(data, width, height, is_snorm),
         BlockFormat::BC5 => Ok(decode_bc5(data, width, height, is_snorm)),
-        BlockFormat::BC6H => Err(DdsError::UnsupportedFormat(
-            "BC6H decoding is not yet supported (HDR format)".to_string(),
-        )),
+        BlockFormat::BC6H => decode_bc6h(data, width, height, is_snorm),
         BlockFormat::BC7 => decode_4bpp(data, width, height, bcdec_rs::bc7),
     }
 }
@@ -175,4 +173,53 @@ fn decode_bc5(data: &[u8], width: u32, height: u32, is_snorm: bool) -> Vec<u8> {
         }
     }
     out
+}
+
+fn decode_bc6h(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    is_signed: bool,
+) -> Result<Vec<u8>, DdsError> {
+    let w = width as usize;
+    let h = height as usize;
+    let bw = (w + 3) / 4;
+    let bh = (h + 3) / 4;
+    let pitch = 4 * 3;
+    let mut out = vec![0u8; w * h * 4];
+    let mut block_buf = [0.0f32; 4 * 4 * 3];
+
+    for by in 0..bh {
+        for bx in 0..bw {
+            let offset = (by * bw + bx) * 16;
+            if offset + 16 > data.len() {
+                break;
+            }
+
+            bcdec_rs::bc6h_float(&data[offset..], &mut block_buf, pitch, is_signed);
+
+            for py in 0..4 {
+                for px in 0..4 {
+                    let x = bx * 4 + px;
+                    let y = by * 4 + py;
+                    if x >= w || y >= h {
+                        continue;
+                    }
+                    let src = (py * 4 + px) * 3;
+                    let dst = (y * w + x) * 4;
+                    out[dst] = hdr_to_u8(block_buf[src]);
+                    out[dst + 1] = hdr_to_u8(block_buf[src + 1]);
+                    out[dst + 2] = hdr_to_u8(block_buf[src + 2]);
+                    out[dst + 3] = 255;
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn hdr_to_u8(v: f32) -> u8 {
+    let t = v.max(0.0);
+    let mapped = t / (1.0 + t);
+    (mapped * 255.0).clamp(0.0, 255.0) as u8
 }
