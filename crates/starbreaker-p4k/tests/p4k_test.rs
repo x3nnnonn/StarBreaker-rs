@@ -223,3 +223,52 @@ fn list_dir_character_customizer() {
         "expected MasculineDefault"
     );
 }
+
+fn build_v2_archive(name: &str, content: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(content);
+    let data_offset = 0u64;
+    let cdr_offset = buf.len() as u64;
+
+    let mut rec = [0u8; 204];
+    rec[0x0A..0x12].copy_from_slice(&(content.len() as u64).to_le_bytes());
+    rec[0x12..0x1A].copy_from_slice(&(content.len() as u64).to_le_bytes());
+    rec[0x1A..0x22].copy_from_slice(&data_offset.to_le_bytes());
+    rec[0x22..0x2A].copy_from_slice(&0u64.to_le_bytes());
+    buf.extend_from_slice(&rec);
+
+    let name_offset = buf.len() as u64;
+    let mut names = name.as_bytes().to_vec();
+    names.push(0);
+    buf.extend_from_slice(&names);
+
+    let mut eocd = [0u8; 175];
+    eocd[0x00..0x08].copy_from_slice(&1u64.to_le_bytes());
+    eocd[0x10..0x18].copy_from_slice(&cdr_offset.to_le_bytes());
+    eocd[0x18..0x20].copy_from_slice(&204u64.to_le_bytes());
+    eocd[0x28..0x30].copy_from_slice(&name_offset.to_le_bytes());
+    eocd[0x30..0x38].copy_from_slice(&(names.len() as u64).to_le_bytes());
+    eocd[0x60..0x68].copy_from_slice(&4096u64.to_le_bytes());
+    eocd[0xA9..0xAB].copy_from_slice(&2u16.to_le_bytes());
+    eocd[0xAB..0xAF].copy_from_slice(&0x696A694Au32.to_le_bytes());
+    buf.extend_from_slice(&eocd);
+
+    buf
+}
+
+#[test]
+fn parse_synthetic_v2() {
+    let content = b"hello v2 format, no local header here";
+    let data = build_v2_archive("Data/test.txt", content);
+
+    let archive = P4kArchive::from_bytes(&data).unwrap();
+    assert_eq!(archive.len(), 1);
+
+    let entry = archive.entry("Data\\test.txt").expect("entry by normalized name");
+    assert_eq!(entry.uncompressed_size, content.len() as u64);
+    assert_eq!(entry.compressed_size, content.len() as u64);
+    assert!(!entry.has_local_header);
+
+    let read = archive.read(entry).unwrap();
+    assert_eq!(read, content);
+}

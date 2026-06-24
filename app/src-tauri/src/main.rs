@@ -214,6 +214,9 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::get_system_theme,
             commands::discover_p4k,
+            commands::get_install_root,
+            commands::set_install_root,
+            commands::reset_install_root,
             commands::open_p4k,
             commands::list_dir,
             commands::list_subdirs,

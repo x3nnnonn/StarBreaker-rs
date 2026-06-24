@@ -104,14 +104,49 @@ pub fn get_system_theme() -> SystemPalette {
 
 /// Discover all Data.p4k installations across channels.
 #[tauri::command]
-pub fn discover_p4k() -> Vec<DiscoverResult> {
-    starbreaker_common::discover::find_all_p4k()
+pub fn discover_p4k(state: State<'_, AppState>) -> Vec<DiscoverResult> {
+    let custom = state.install_root.lock().clone();
+    let discovered = match custom {
+        Some(root) => starbreaker_common::discover::find_all_p4k_in(&root),
+        None => starbreaker_common::discover::find_all_p4k(),
+    };
+    discovered
         .into_iter()
         .map(|d| DiscoverResult {
             path: d.path.to_string_lossy().into_owned(),
             source: d.source,
         })
         .collect()
+}
+
+#[derive(Serialize)]
+pub struct InstallRootInfo {
+    pub path: String,
+    pub source: String,
+}
+
+#[tauri::command]
+pub fn get_install_root(state: State<'_, AppState>) -> InstallRootInfo {
+    match state.install_root.lock().clone() {
+        Some(root) => InstallRootInfo {
+            path: root.to_string_lossy().into_owned(),
+            source: "custom".to_string(),
+        },
+        None => InstallRootInfo {
+            path: starbreaker_common::discover::DEFAULT_ROOT.to_string(),
+            source: "default".to_string(),
+        },
+    }
+}
+
+#[tauri::command]
+pub fn set_install_root(state: State<'_, AppState>, path: String) {
+    *state.install_root.lock() = Some(Path::new(&path).to_path_buf());
+}
+
+#[tauri::command]
+pub fn reset_install_root(state: State<'_, AppState>) {
+    *state.install_root.lock() = None;
 }
 
 /// Open a P4k file and store it in managed state.

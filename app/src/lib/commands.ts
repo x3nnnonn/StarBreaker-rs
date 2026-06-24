@@ -59,6 +59,25 @@ export async function discoverP4k(): Promise<DiscoverResult[]> {
   return invoke<DiscoverResult[]>("discover_p4k");
 }
 
+function singleDialogPath(result: string | string[] | null): string | null {
+  if (result === null) {
+    return null;
+  }
+  return Array.isArray(result) ? (result[0] ?? null) : result;
+}
+
+export async function getInstallRoot(): Promise<InstallRootInfo> {
+  return invoke<InstallRootInfo>("get_install_root");
+}
+
+export async function setInstallRoot(path: string): Promise<void> {
+  return invoke<void>("set_install_root", { path });
+}
+
+export async function resetInstallRoot(): Promise<void> {
+  return invoke<void>("reset_install_root");
+}
+
 export interface P4kInfo {
   entry_count: number;
   total_bytes: number;

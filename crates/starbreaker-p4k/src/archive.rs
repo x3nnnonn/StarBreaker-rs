@@ -18,6 +18,7 @@ pub struct P4kEntry {
     pub offset: u64,
     pub crc32: u32,
     pub last_modified: u32,
+    pub has_local_header: bool,
 }
 
 /// An item returned by `list_dir` — either a file entry or a subdirectory name.
@@ -90,19 +91,19 @@ impl<'a> P4kArchive<'a> {
         }
 
         let mut reader = SpanReader::new_at(data, offset);
-        let local_header = reader.read_type::<LocalFileHeader>()?;
-        let sig = local_header.signature;
-        if sig != LOCAL_FILE_SIGNATURE && sig != LOCAL_FILE_CIG_SIGNATURE {
-            return Err(P4kError::InvalidSignature {
-                expected: LOCAL_FILE_SIGNATURE,
-                got: sig,
-            });
+        if entry.has_local_header {
+            let local_header = reader.read_type::<LocalFileHeader>()?;
+            let sig = local_header.signature;
+            if sig != LOCAL_FILE_SIGNATURE && sig != LOCAL_FILE_CIG_SIGNATURE {
+                return Err(P4kError::InvalidSignature {
+                    expected: LOCAL_FILE_SIGNATURE,
+                    got: sig,
+                });
+            }
+            let skip =
+                local_header.file_name_length as usize + local_header.extra_field_length as usize;
+            reader.advance(skip)?;
         }
-
-        // Skip the file name and extra field to reach the raw data
-        let skip =
-            local_header.file_name_length as usize + local_header.extra_field_length as usize;
-        reader.advance(skip)?;
 
         let raw = reader.read_bytes(entry.compressed_size as usize)?;
 
@@ -128,33 +129,31 @@ impl<'a> P4kArchive<'a> {
         file: &mut (impl Read + Seek),
         entry: &P4kEntry,
     ) -> Result<Vec<u8>, P4kError> {
-        // Seek to the local file header
         file.seek(SeekFrom::Start(entry.offset))?;
 
-        // Read the local file header
-        let mut header_buf = [0u8; size_of::<LocalFileHeader>()];
-        file.read_exact(&mut header_buf)?;
-        let local_header: LocalFileHeader =
-            *zerocopy::FromBytes::ref_from_bytes(&header_buf).map_err(|_| {
-                P4kError::Parse(starbreaker_common::ParseError::InvalidLayout(
-                    "LocalFileHeader".to_string(),
-                ))
-            })?;
+        if entry.has_local_header {
+            let mut header_buf = [0u8; size_of::<LocalFileHeader>()];
+            file.read_exact(&mut header_buf)?;
+            let local_header: LocalFileHeader =
+                *zerocopy::FromBytes::ref_from_bytes(&header_buf).map_err(|_| {
+                    P4kError::Parse(starbreaker_common::ParseError::InvalidLayout(
+                        "LocalFileHeader".to_string(),
+                    ))
+                })?;
 
-        let sig = local_header.signature;
-        if sig != LOCAL_FILE_SIGNATURE && sig != LOCAL_FILE_CIG_SIGNATURE {
-            return Err(P4kError::InvalidSignature {
-                expected: LOCAL_FILE_SIGNATURE,
-                got: sig,
-            });
+            let sig = local_header.signature;
+            if sig != LOCAL_FILE_SIGNATURE && sig != LOCAL_FILE_CIG_SIGNATURE {
+                return Err(P4kError::InvalidSignature {
+                    expected: LOCAL_FILE_SIGNATURE,
+                    got: sig,
+                });
+            }
+
+            let skip =
+                local_header.file_name_length as u64 + local_header.extra_field_length as u64;
+            file.seek(SeekFrom::Current(skip as i64))?;
         }
 
-        // Skip file name and extra field
-        let skip =
-            local_header.file_name_length as u64 + local_header.extra_field_length as u64;
-        file.seek(SeekFrom::Current(skip as i64))?;
-
-        // Read compressed data
         let mut raw = vec![0u8; entry.compressed_size as usize];
         file.read_exact(&mut raw)?;
 
@@ -349,24 +348,25 @@ fn parse_entries(
         }
     }
 
-    // Build path index — FxHashMap for exact lookup
+    Ok(build_central_directory(entries))
+}
+
+fn build_central_directory(entries: Vec<P4kEntry>) -> CentralDirectory {
     let mut path_index = FxHashMap::with_capacity_and_hasher(entries.len(), Default::default());
     for (i, entry) in entries.iter().enumerate() {
         path_index.insert(entry.name.clone(), i);
     }
 
-    // Build lowercase index for case-insensitive lookup
     let mut lowercase_index =
         FxHashMap::with_capacity_and_hasher(entries.len(), Default::default());
     for (i, entry) in entries.iter().enumerate() {
         lowercase_index.insert(entry.name.to_ascii_lowercase(), i);
     }
 
-    // Build sorted index for directory listing (prefix scan)
     let mut sorted_index: Vec<u32> = (0..entries.len() as u32).collect();
     sorted_index.sort_unstable_by(|&a, &b| entries[a as usize].name.cmp(&entries[b as usize].name));
 
-    Ok((entries, path_index, lowercase_index, sorted_index))
+    (entries, path_index, lowercase_index, sorted_index)
 }
 
 /// Parse the central directory from raw archive data (in-memory byte slice).
@@ -376,6 +376,9 @@ pub(crate) fn parse_central_directory(
     data: &[u8],
     progress: Option<&starbreaker_common::Progress>,
 ) -> Result<CentralDirectory, P4kError> {
+    if is_v2_tail(data) {
+        return parse_v2_central_directory(data);
+    }
     let loc = locate_central_directory(data, 0)?;
     let cd_data = &data[loc.cd_offset as usize..];
     parse_entries(cd_data, loc.total_entries, loc.is_zip64, progress)
@@ -397,6 +400,10 @@ pub(crate) fn parse_central_directory_from_file(
     file.seek(SeekFrom::Start(tail_offset))?;
     let mut tail = vec![0u8; tail_size];
     file.read_exact(&mut tail)?;
+
+    if is_v2_tail(&tail) {
+        return parse_v2_central_directory_from_file(file, &tail);
+    }
 
     let loc = locate_central_directory(&tail, tail_offset)?;
 
@@ -437,6 +444,117 @@ fn find_zip64_locator(data: &[u8], eocd_offset: usize) -> Result<usize, P4kError
     }
 
     Err(P4kError::EocdNotFound)
+}
+
+fn is_v2_tail(tail: &[u8]) -> bool {
+    let n = tail.len();
+    if n < EOCD_V2_SIZE {
+        return false;
+    }
+    let magic = u32::from_le_bytes([tail[n - 4], tail[n - 3], tail[n - 2], tail[n - 1]]);
+    let version = u16::from_le_bytes([tail[n - 6], tail[n - 5]]);
+    magic == EOCD_V2_MAGIC && version == EOCD_V2_VERSION
+}
+
+fn read_v2_name(names: &[u8], offset: usize) -> String {
+    let Some(slice) = names.get(offset..) else {
+        return String::new();
+    };
+    let end = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
+    let mut name = String::with_capacity(end);
+    for &b in &slice[..end] {
+        if b == b'/' {
+            name.push('\\');
+        } else {
+            name.push(b as char);
+        }
+    }
+    name
+}
+
+fn parse_v2_entries(
+    cd_data: &[u8],
+    names: &[u8],
+    total_entries: u64,
+) -> Result<Vec<P4kEntry>, P4kError> {
+    let mut reader = SpanReader::new(cd_data);
+    let mut entries = Vec::with_capacity(total_entries as usize);
+    for _ in 0..total_entries {
+        let header = reader.read_type::<CentralDirHeaderV2>()?;
+        let name = read_v2_name(names, header.offset_to_filename as usize);
+        let last_modified =
+            ((header.last_mod_date as u32) << 16) | (header.last_mod_time as u32);
+        entries.push(P4kEntry {
+            name,
+            compressed_size: header.compressed_size,
+            uncompressed_size: header.uncompressed_size,
+            compression_method: header.compression_method,
+            is_encrypted: header.encryption_flag == 1,
+            offset: header.offset_to_file_data,
+            crc32: header.crc32,
+            last_modified,
+            has_local_header: false,
+        });
+    }
+    Ok(entries)
+}
+
+fn read_v2_eocd(reader: &mut SpanReader) -> Result<Eocd2Record, P4kError> {
+    let eocd = *reader.read_type::<Eocd2Record>()?;
+    if eocd.magic != EOCD_V2_MAGIC {
+        return Err(P4kError::InvalidSignature {
+            expected: EOCD_V2_MAGIC,
+            got: eocd.magic,
+        });
+    }
+    Ok(eocd)
+}
+
+fn parse_v2_central_directory(data: &[u8]) -> Result<CentralDirectory, P4kError> {
+    let eocd_offset = data
+        .len()
+        .checked_sub(EOCD_V2_SIZE)
+        .ok_or(P4kError::EocdNotFound)?;
+    let mut reader = SpanReader::new_at(data, eocd_offset);
+    let eocd = read_v2_eocd(&mut reader)?;
+
+    let cd_offset = eocd.central_directory_offset as usize;
+    let cd_size = eocd.central_directory_size as usize;
+    let name_offset = eocd.name_table_offset as usize;
+    let name_size = eocd.name_table_size as usize;
+
+    let cd_data = data
+        .get(cd_offset..cd_offset.saturating_add(cd_size))
+        .ok_or(P4kError::EocdNotFound)?;
+    let names = data
+        .get(name_offset..name_offset.saturating_add(name_size))
+        .ok_or(P4kError::EocdNotFound)?;
+
+    let entries = parse_v2_entries(cd_data, names, eocd.number_of_entries)?;
+    Ok(build_central_directory(entries))
+}
+
+fn parse_v2_central_directory_from_file(
+    file: &mut (impl Read + Seek),
+    tail: &[u8],
+) -> Result<CentralDirectory, P4kError> {
+    let eocd_offset = tail
+        .len()
+        .checked_sub(EOCD_V2_SIZE)
+        .ok_or(P4kError::EocdNotFound)?;
+    let mut reader = SpanReader::new_at(tail, eocd_offset);
+    let eocd = read_v2_eocd(&mut reader)?;
+
+    file.seek(SeekFrom::Start(eocd.central_directory_offset))?;
+    let mut cd_data = vec![0u8; eocd.central_directory_size as usize];
+    file.read_exact(&mut cd_data)?;
+
+    file.seek(SeekFrom::Start(eocd.name_table_offset))?;
+    let mut names = vec![0u8; eocd.name_table_size as usize];
+    file.read_exact(&mut names)?;
+
+    let entries = parse_v2_entries(&cd_data, &names, eocd.number_of_entries)?;
+    Ok(build_central_directory(entries))
 }
 
 /// Read a single central directory entry.
@@ -585,6 +703,7 @@ fn read_entry(reader: &mut SpanReader, is_zip64: bool) -> Result<P4kEntry, P4kEr
         offset: local_header_offset,
         crc32: header.crc32,
         last_modified: header.last_modified,
+        has_local_header: true,
     })
 }
 

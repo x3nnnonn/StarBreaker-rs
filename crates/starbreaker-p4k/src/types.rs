@@ -120,3 +120,50 @@ pub struct LocalFileHeader {
 }
 
 const _: () = assert!(size_of::<LocalFileHeader>() == 30);
+
+pub const EOCD_V2_MAGIC: u32 = 0x696A694A;
+pub const EOCD_V2_VERSION: u16 = 2;
+pub const EOCD_V2_SIZE: usize = 175;
+pub const CDR_V2_ENTRY_SIZE: usize = 204;
+
+#[derive(Debug, Clone, Copy, FromBytes, Immutable, KnownLayout)]
+#[repr(C, packed)]
+pub struct Eocd2Record {
+    pub number_of_entries: u64,
+    pub number_of_extension_entries: u64,
+    pub central_directory_offset: u64,
+    pub central_directory_size: u64,
+    pub central_directory_extension_size: u64,
+    pub name_table_offset: u64,
+    pub name_table_size: u64,
+    pub extension_text_size: u64,
+    pub end_of_payload: u64,
+    pub num_freelist_blocks: u64,
+    pub trie_cache_offset: u64,
+    pub trie_cache_size: u64,
+    pub sector_size: u64,
+    pub status_flags: u8,
+    pub manifest_sha256: [u8; 64],
+    pub version: u16,
+    pub magic: u32,
+}
+
+const _: () = assert!(size_of::<Eocd2Record>() == EOCD_V2_SIZE);
+
+#[derive(Debug, Clone, Copy, FromBytes, Immutable, KnownLayout)]
+#[repr(C, packed)]
+pub struct CentralDirHeaderV2 {
+    pub compression_method: u16,
+    pub last_mod_time: u16,
+    pub last_mod_date: u16,
+    pub crc32: u32,
+    pub compressed_size: u64,
+    pub uncompressed_size: u64,
+    pub offset_to_file_data: u64,
+    pub offset_to_filename: u64,
+    pub signature: [u8; 128],
+    pub encryption_flag: u16,
+    pub sha256: [u8; 32],
+}
+
+const _: () = assert!(size_of::<CentralDirHeaderV2>() == CDR_V2_ENTRY_SIZE);

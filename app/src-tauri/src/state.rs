@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use parking_lot::Mutex;
@@ -23,6 +24,7 @@ pub struct AppState {
     pub bank_cache: Mutex<HashMap<String, Option<Arc<Hierarchy>>>>,
     /// Maps wwise filename (bnk/wem) to full P4k path (e.g. "Data\\Sounds\\wwise\\English(US)\\Foo.bnk").
     pub wwise_paths: Mutex<HashMap<String, String>>,
+    pub install_root: Mutex<Option<PathBuf>>,
 }
 
 impl AppState {
@@ -36,6 +38,7 @@ impl AppState {
             atl_index: Mutex::new(None),
             bank_cache: Mutex::new(HashMap::new()),
             wwise_paths: Mutex::new(HashMap::new()),
+            install_root: Mutex::new(None),
         }
     }
 }

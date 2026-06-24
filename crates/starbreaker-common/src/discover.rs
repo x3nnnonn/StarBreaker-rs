@@ -164,6 +164,19 @@ pub fn find_all_p4k() -> Vec<Discovered> {
         .collect()
 }
 
+pub fn find_all_p4k_in(root: &std::path::Path) -> Vec<Discovered> {
+    CHANNELS
+        .iter()
+        .filter_map(|&channel| {
+            let file = root.join(channel).join("Data.p4k");
+            file.is_file().then(|| Discovered {
+                path: file,
+                source: channel.to_string(),
+            })
+        })
+        .collect()
+}
+
 /// Find StarCitizen.exe.
 pub fn find_exe() -> Result<Discovered, DiscoverError> {
     find_file(ENV_EXE, "Bin64/StarCitizen.exe")
