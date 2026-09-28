@@ -5340,6 +5340,7 @@ dependencies = [
  "image",
  "indicatif",
  "log",
+ "memmap2",
  "parking_lot",
  "quick-xml 0.37.5",
  "rayon",

@@ -43,6 +43,11 @@ pub fn current(p4k: &MappedP4k) -> Result<FileIndex> {
             Ok(children)
         }).collect();
     for children in nested? { index.extend(children); }
+    for entry in p4k.entries().iter().filter(|entry| crate::diff_shaders::is_shader_archive(&entry.name)) {
+        crate::diff_shaders::with_archive(p4k, entry, |archive| {
+            crate::diff_shaders::add_inventory(&mut index, &entry.name, archive)
+        })?;
+    }
     Ok(index)
 }
 

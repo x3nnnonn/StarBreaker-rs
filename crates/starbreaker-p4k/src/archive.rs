@@ -584,7 +584,14 @@ fn read_entry(reader: &mut SpanReader, is_zip64: bool) -> Result<P4kEntry, P4kEr
     let mut local_header_offset = header.local_header_offset as u64;
     let mut is_encrypted = false;
 
-    if is_zip64 {
+    let extra_data = reader.read_bytes(header.extra_field_length as usize)?;
+    let zip64_bytes = usize::from(header.uncompressed_size == u32::MAX) * 8
+        + usize::from(header.compressed_size == u32::MAX) * 8
+        + usize::from(header.local_header_offset == u32::MAX) * 8
+        + usize::from(header.disk_number_start == u16::MAX) * 4;
+    let has_cig_extra = is_zip64 && extra_data.get(..2) == Some(&[1, 0])
+        && extra_data.get(4 + zip64_bytes..6 + zip64_bytes) == Some(&[0, 0x50]);
+    if has_cig_extra {
         // Parse extra fields for ZIP64 entries
         // The C# code reads extra fields in a specific order:
         // 1. Tag 0x0001 (standard ZIP64 extended info)
@@ -592,7 +599,6 @@ fn read_entry(reader: &mut SpanReader, is_zip64: bool) -> Result<P4kEntry, P4kEr
         // 3. Tag 0x5002 (CIG encryption flag)
         // 4. Tag 0x5003 (CIG custom)
 
-        let extra_data = reader.read_bytes(header.extra_field_length as usize)?;
         let mut extra_reader = SpanReader::new(extra_data);
 
         // --- Extra field 0x0001: ZIP64 extended sizes ---
@@ -680,9 +686,27 @@ fn read_entry(reader: &mut SpanReader, is_zip64: bool) -> Result<P4kEntry, P4kEr
         let size_5003 = extra_reader.read_u16()?;
         extra_reader.advance((size_5003 as usize).saturating_sub(4))?;
     } else {
-        // Non-ZIP64: skip extra fields and file comment
-        let skip = header.extra_field_length as usize;
-        reader.advance(skip)?;
+        let mut extra_reader = SpanReader::new(extra_data);
+        let mut found_zip64 = false;
+        while extra_reader.position() < extra_data.len() {
+            let tag = extra_reader.read_u16()?;
+            let size = extra_reader.read_u16()? as usize;
+            let payload = extra_reader.read_bytes(size)?;
+            if tag != 1 { continue; }
+            found_zip64 = true;
+            let mut values = SpanReader::new(payload);
+            if header.uncompressed_size == u32::MAX { uncompressed_size = values.read_u64()?; }
+            if header.compressed_size == u32::MAX { compressed_size = values.read_u64()?; }
+            if header.local_header_offset == u32::MAX { local_header_offset = values.read_u64()?; }
+            if header.disk_number_start == u16::MAX { values.read_u32()?; }
+        }
+        if zip64_bytes != 0 && !found_zip64 {
+            return Err(P4kError::Parse(starbreaker_common::ParseError::UnexpectedValue {
+                offset: reader.position(),
+                expected: "ZIP64 member extended values".into(),
+                actual: "missing ZIP64 extra field".into(),
+            }));
+        }
     }
 
     // Skip file comment
@@ -706,6 +730,10 @@ fn read_entry(reader: &mut SpanReader, is_zip64: bool) -> Result<P4kEntry, P4kEr
         has_local_header: true,
     })
 }
+
+#[cfg(test)]
+#[path = "zip64_tests.rs"]
+mod zip64_tests;
 
 /// Decompress zstd data with a pre-allocation hint.
 fn zstd_decompress(data: &[u8], size_hint: usize) -> Result<Vec<u8>, P4kError> {

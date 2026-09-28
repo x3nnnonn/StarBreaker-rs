@@ -32,7 +32,7 @@ impl ManifestFormat {
 }
 
 #[derive(Args)]
-#[command(about = "Export a diff snapshot including DataCore, XML assets, animation databases and object containers")]
+#[command(about = "Export a diff snapshot including DataCore, XML assets, animation databases, object containers and shaders")]
 pub struct DiffArgs {
     #[arg(long, short = 'g', env = "GAME_FOLDER")]
     pub game: PathBuf,
@@ -77,7 +77,7 @@ impl DiffArgs {
         }
 
         let total = Instant::now();
-        if diff_against.is_some() { eprintln!("[INFO] --diff-against is ignored; comparing with the existing dump in {}", output.display()); }
+        if diff_against.is_some() { eprintln!("[INFO] --diff-against is ignored. Comparing with the existing dump in {}", output.display()); }
         let baseline_path = crate::diff_index::exists(&output).then_some(output.as_path());
         let previous = baseline_path.map(|path| {
             let start = Instant::now();
@@ -149,6 +149,10 @@ impl DiffArgs {
 
         timed("P4k XML/animation/SOC contents", || {
             crate::diff_p4k_contents::extract_incremental_contents(&p4k, &p4kcontents_dir, reuse)
+        })?;
+
+        timed("Readable shaders and cache changes", || {
+            crate::diff_shaders::export(&p4k, &output, previous.as_ref(), &current, keep)
         })?;
 
         if extract_dds {
@@ -251,8 +255,7 @@ pub(crate) fn dump_p4k_manifest(p4k: &MappedP4k, output: &Path, format: Manifest
     for entry in p4k.entries() {
         let lower = entry.name.to_ascii_lowercase();
         let is_archive = lower.ends_with(".socpak") || lower.ends_with(".pak");
-        let is_shadercache = lower.contains("shadercache_");
-        if is_archive && !is_shadercache {
+        if is_archive && (!lower.contains("shadercache_") || crate::diff_shaders::is_shader_archive(&entry.name)) {
             socpak_refs.push(entry);
         }
         let norm = entry.name.replace('\\', "/");
@@ -297,6 +300,15 @@ pub(crate) fn dump_p4k_manifest(p4k: &MappedP4k, output: &Path, format: Manifest
     let mut written = written?;
 
     let nested: Result<Vec<_>> = socpak_refs.par_iter().map(|socpak_entry| {
+        if crate::diff_shaders::is_shader_archive(&socpak_entry.name) {
+            return crate::diff_shaders::with_archive(p4k, socpak_entry, |inner| {
+                let relative = socpak_entry.name.replace('\\', "/");
+                let files = dump_archive_manifests(output, &relative, inner, ext, format)?;
+                let mut index = crate::diff_index::FileIndex::new();
+                crate::diff_shaders::add_inventory(&mut index, &relative, inner)?;
+                Ok((index, files))
+            });
+        }
         let data = match p4k.read(socpak_entry) {
             Ok(d) => d,
             Err(e) => {
@@ -343,7 +355,7 @@ fn dump_archive_manifests(
         .unwrap_or_else(|| "root".into());
 
     let mut by_dir: BTreeMap<String, Vec<&P4kEntry>> = BTreeMap::new();
-    for entry in archive.entries() {
+    for entry in archive.entries().iter().filter(|entry| !entry.name.ends_with(['/', '\\'])) {
         let norm = entry.name.replace('\\', "/");
         let dir = norm.rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_default();
         by_dir.entry(dir).or_default().push(entry);
