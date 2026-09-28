@@ -6,48 +6,33 @@ use starbreaker_dds::DdsFile;
 use starbreaker_p4k::{MappedP4k, P4kArchive};
 
 use crate::error::{CliError, Result};
-use crate::p4k_compare::{self, ComparisonStatus};
+use crate::diff_index::{FileIndex, key};
 
 pub fn extract_dds_files(
     p4k: &MappedP4k,
     output: &Path,
-    diff_against: Option<&Path>,
+    current: &FileIndex,
+    previous: Option<&FileIndex>,
 ) -> Result<()> {
     std::fs::create_dir_all(output)?;
 
-    let entries_to_extract: Vec<String> = if let Some(against) = diff_against {
-        let previous_path = p4k_compare::resolve_previous_p4k_path(against);
-        if previous_path.is_file() {
-            let previous = MappedP4k::open(&previous_path)?;
-            let left = p4k_compare::build_file_index(&previous);
-            let right = p4k_compare::build_file_index(p4k);
-            let paths = p4k_compare::compare_indexes(&left, &right)
-                .into_iter()
-                .filter(|(path, status)| {
-                    matches!(status, ComparisonStatus::Added | ComparisonStatus::Modified)
-                        && is_base_dds_entry(path)
-                        && !is_mipmap_filename_filtered(path)
-                })
-                .map(|(path, _)| path)
-                .collect::<Vec<_>>();
-            eprintln!("Found {} new/modified DDS files to extract.", paths.len());
-            paths
-        } else {
-            eprintln!(
-                "[WARN] Previous P4K not found at {}. Extracting all DDS files.",
-                previous_path.display()
-            );
-            base_dds_paths(p4k)
-        }
-    } else {
-        base_dds_paths(p4k)
-    };
+    let entries_to_extract = changed_dds_paths(current, previous);
+    eprintln!("Found {} new/modified DDS files to extract.", entries_to_extract.len());
+    let mut names = std::collections::HashMap::new();
+    for path in current.keys().filter(|path| path.ends_with(".dds") && is_base_dds_entry(path)) {
+        *names.entry(dds_png_output_name(path)).or_insert(0usize) += 1;
+    }
 
     let p4k = Arc::new(p4k);
     let output = Arc::new(output.to_path_buf());
     let (processed, failed) = entries_to_extract
         .par_iter()
-        .map(|path| extract_one_dds(&p4k, &output, path))
+        .map(|path| {
+            let name = dds_png_output_name(path);
+            let relative = if names[&name] > 1 { std::path::PathBuf::from(path).with_extension("png") } else { name.into() };
+            let destination = output.join(relative);
+            extract_one_dds(&p4k, &destination, path)
+        })
         .fold(
             || (0usize, 0usize),
             |(ok, err), result| match result {
@@ -61,10 +46,11 @@ pub fn extract_dds_files(
         .reduce(|| (0, 0), |(a, b), (c, d)| (a + c, b + d));
 
     eprintln!("Extracted {processed} DDS files ({failed} failed).");
+    if failed != 0 { return Err(CliError::InvalidInput(format!("{failed} DDS exports failed; snapshot index was not advanced"))); }
     Ok(())
 }
 
-fn extract_one_dds(p4k: &MappedP4k, output: &Path, path: &str) -> Result<()> {
+fn extract_one_dds(p4k: &MappedP4k, destination: &Path, path: &str) -> Result<()> {
     let load_path = dds_merge_base_path(path);
     let data = read_entry_at_path(p4k, &load_path)?;
     let reader = P4kSiblingReader {
@@ -72,9 +58,15 @@ fn extract_one_dds(p4k: &MappedP4k, output: &Path, path: &str) -> Result<()> {
         base_path: load_path,
     };
     let dds = DdsFile::from_split(&data, &reader).or_else(|_| DdsFile::from_bytes(&data))?;
-    let png_name = dds_png_output_name(path);
-    let out_path = output.join(png_name);
-    dds.save_png(&out_path, 0)?;
+    if let Some(parent) = destination.parent() { std::fs::create_dir_all(parent)?; }
+    use image::ImageEncoder;
+    let pixels = dds.decode_rgba(0)?;
+    let (width, height) = dds.dimensions(0);
+    let mut output = std::io::BufWriter::new(std::fs::File::create(destination)?);
+    image::codecs::png::PngEncoder::new_with_quality(&mut output,
+        image::codecs::png::CompressionType::Fast, image::codecs::png::FilterType::Adaptive)
+        .write_image(&pixels, width, height, image::ExtendedColorType::Rgba8)?;
+    std::io::Write::flush(&mut output)?;
     Ok(())
 }
 
@@ -88,13 +80,36 @@ fn dds_merge_base_path(path: &str) -> String {
     }
 }
 
-fn base_dds_paths(p4k: &MappedP4k) -> Vec<String> {
-    p4k
-        .entries()
-        .iter()
-        .filter(|e| is_base_dds_entry(&e.name))
-        .map(|e| e.name.replace('/', "\\"))
-        .collect()
+pub(crate) fn changed_dds_paths(current: &FileIndex, previous: Option<&FileIndex>) -> Vec<String> {
+    let mut changed = std::collections::HashSet::new();
+    for (path, meta) in current {
+        if previous.is_some_and(|previous| previous.get(path) == Some(meta)) { continue; }
+        if let Some(base) = dds_family_base(path) {
+            if current.contains_key(&base) && is_base_dds_entry(&base) { changed.insert(base); }
+        }
+    }
+    if let Some(previous) = previous {
+        for path in previous.keys().filter(|path| !current.contains_key(*path)) {
+            if let Some(base) = dds_family_base(path) {
+                if current.contains_key(&base) && is_base_dds_entry(&base) { changed.insert(base); }
+            }
+        }
+    }
+    let mut paths: Vec<_> = changed.into_iter().collect();
+    paths.sort_unstable();
+    paths
+}
+
+fn dds_family_base(path: &str) -> Option<String> {
+    let path = key(path);
+    let start = path.rfind(".dds")?;
+    let suffix = &path[start + 4..];
+    if suffix.is_empty() || suffix == ".a" || suffix.strip_prefix('.').is_some_and(|suffix| {
+        let digits = suffix.strip_suffix('a').unwrap_or(suffix);
+        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+    }) {
+        Some(path[..start + 4].to_owned())
+    } else { None }
 }
 
 fn is_base_dds_entry(name: &str) -> bool {
@@ -106,11 +121,6 @@ fn is_base_dds_entry(name: &str) -> bool {
         return false;
     }
     name.chars().last().is_some_and(|c| !c.is_ascii_digit())
-}
-
-fn is_mipmap_filename_filtered(path: &str) -> bool {
-    let file_name = path.rsplit(['\\', '/']).next().unwrap_or(path);
-    file_name.chars().last().is_some_and(|c| c.is_ascii_digit())
 }
 
 fn dds_png_output_name(entry_path: &str) -> String {
@@ -233,27 +243,40 @@ mod tests {
 
     #[test]
     fn compare_indexes_detects_modified_crc() {
-        use std::collections::HashMap;
+        let left = FileIndex::from([(key(r"Data\a.dds"), (1, 100))]);
+        let right = FileIndex::from([(key(r"Data\a.dds"), (2, 100))]);
+        assert_eq!(changed_dds_paths(&right, Some(&left)), vec!["data/a.dds"]);
+    }
 
-        use crate::p4k_compare::{self, EntryMeta};
-
-        let mut left = HashMap::new();
-        let mut right = HashMap::new();
-        left.insert(
-            r"Data\a.dds".to_string(),
-            EntryMeta {
-                crc32: 1,
-                uncompressed_size: 100,
-            },
-        );
-        right.insert(
-            r"Data\a.dds".to_string(),
-            EntryMeta {
-                crc32: 2,
-                uncompressed_size: 100,
-            },
-        );
-        let result = p4k_compare::compare_indexes(&left, &right);
-        assert_eq!(result[0].1, ComparisonStatus::Modified);
+    #[test]
+    #[ignore = "requires STARBREAKER_DIFF_TEST_P4K and STARBREAKER_DIFF_TEST_OUTPUT"]
+    fn live_png_pixels_and_encoding_time() {
+        let p4k = MappedP4k::open(Path::new(&std::env::var_os("STARBREAKER_DIFF_TEST_P4K").unwrap())).unwrap();
+        let output = std::path::PathBuf::from(std::env::var_os("STARBREAKER_DIFF_TEST_OUTPUT").unwrap());
+        std::fs::create_dir_all(&output).unwrap();
+        let mut count = 0;
+        let mut old_time = std::time::Duration::ZERO;
+        let mut new_time = std::time::Duration::ZERO;
+        for entry in p4k.entries().iter().filter(|entry| entry.name.to_ascii_lowercase().ends_with(".dds") && is_base_dds_entry(&entry.name)) {
+            let data = p4k.read(entry).unwrap();
+            let reader = P4kSiblingReader { p4k: &p4k, base_path: entry.name.clone() };
+            let Ok(dds) = DdsFile::from_split(&data, &reader).or_else(|_| DdsFile::from_bytes(&data)) else { continue; };
+            let (width, height) = dds.dimensions(0);
+            if width < 128 || height < 128 || width > 2048 || height > 2048 { continue; }
+            if dds.decode_rgba(0).is_err() { continue; }
+            let old_path = output.join(format!("{count}-old.png"));
+            let new_path = output.join(format!("{count}-new.png"));
+            let start = std::time::Instant::now();
+            dds.save_png(&old_path, 0).unwrap();
+            old_time += start.elapsed();
+            let start = std::time::Instant::now();
+            extract_one_dds(&p4k, &new_path, &entry.name).unwrap();
+            new_time += start.elapsed();
+            assert_eq!(image::open(&old_path).unwrap().into_rgba8(), image::open(&new_path).unwrap().into_rgba8(), "{}", entry.name);
+            count += 1;
+            if count == 24 { break; }
+        }
+        assert_eq!(count, 24);
+        eprintln!("24 PNGs: old decode/encode {:.3}s; new read/decode/encode {:.3}s; identical pixels", old_time.as_secs_f64(), new_time.as_secs_f64());
     }
 }

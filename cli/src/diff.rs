@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -11,6 +11,10 @@ use starbreaker_p4k::{MappedP4k, P4kArchive, P4kEntry};
 use crate::common::load_p4k;
 use crate::dcb::DcbFormat;
 use crate::error::{CliError, Result};
+
+#[cfg(test)]
+#[path = "diff_container_cache_tests.rs"]
+mod container_cache_tests;
 
 #[derive(Clone, Copy, ValueEnum)]
 pub enum ManifestFormat {
@@ -43,11 +47,14 @@ pub struct DiffArgs {
     #[arg(
         long,
         env = "DIFF_AGAINST",
-        help = "Previous P4K file or diff output directory; enables new SOCPAK list and (with --extract-dds) texture diff"
+        alias = "base",
+        help = "Deprecated and ignored. CRC32 comparison always uses the existing output dump"
     )]
     pub diff_against: Option<PathBuf>,
     #[arg(long)]
     pub dds_only: bool,
+    #[arg(long, help = "Regenerate all outputs instead of reusing validated unchanged exports")]
+    pub rebuild: bool,
 }
 
 impl DiffArgs {
@@ -60,6 +67,7 @@ impl DiffArgs {
             extract_dds,
             diff_against,
             dds_only,
+            rebuild,
         } = self;
 
         if dds_only && !extract_dds {
@@ -68,27 +76,28 @@ impl DiffArgs {
             ));
         }
 
-        if !keep && !dds_only {
-            timed("Clear old output", || clear_old(&output))?;
-        }
         let total = Instant::now();
-
+        if diff_against.is_some() { eprintln!("[INFO] --diff-against is ignored; comparing with the existing dump in {}", output.display()); }
+        let baseline_path = crate::diff_index::exists(&output).then_some(output.as_path());
+        let previous = baseline_path.map(|path| {
+            let start = Instant::now();
+            let index = crate::diff_index::load(path)?;
+            eprintln!("[DONE] Baseline: {} entries from {} in {:.1}s", index.len(), path.display(), start.elapsed().as_secs_f64());
+            Ok::<_, CliError>(index)
+        }).transpose()?;
         let p4k_path = game.join("Data.p4k");
         let exe_path = game.join("Bin64").join("StarCitizen.exe");
         let p4k = load_p4k(Some(&p4k_path))?;
-
+        std::fs::create_dir_all(&output)?;
+        let reuse = if rebuild { None } else { previous.as_ref() };
         if dds_only {
-            if !keep {
-                let dds_dir = output.join("DDS_Files");
-                if dds_dir.exists() {
-                    parallel_remove_dir_all(&dds_dir)?;
-                }
-            }
+            let current = crate::diff_index::current(&p4k)?;
             timed("DDS extraction", || {
                 crate::diff_dds::extract_dds_files(
                     &p4k,
                     &output.join("DDS_Files"),
-                    diff_against.as_deref(),
+                    &current,
+                    reuse,
                 )
             })?;
             eprintln!("[DONE] total: {:.1}s", total.elapsed().as_secs_f64());
@@ -97,24 +106,49 @@ impl DiffArgs {
 
         let p4kcontents_dir = output.join("P4kContents");
 
-        timed("P4k manifest", || dump_p4k_manifest(&p4k, &output.join("P4k"), format))?;
-        timed("Localization", || extract_localization(&p4k, &p4kcontents_dir))?;
-        timed("TagDatabase", || extract_tag_database(&p4k, &p4kcontents_dir))?;
-        timed("DataCore records", || {
-            crate::dcb::extract(
-                Some(p4k_path.clone()),
-                None,
-                output.join("DataCore"),
+        let mut current = crate::diff_index::FileIndex::new();
+        timed("Current archive CRC32 inventory", || {
+            current = crate::diff_index::current(&p4k)?;
+            Ok(())
+        })?;
+        timed("Localization", || extract_localization(&p4k, &p4kcontents_dir, reuse))?;
+        let dcb_entry = p4k.entry_case_insensitive("Data\\Game2.dcb").or_else(|| p4k.entry_case_insensitive("Data\\Game.dcb"))
+            .ok_or_else(|| CliError::NotFound("DataCore in current P4K".into()))?;
+        timed("DataCore records, types, enums and backup", || {
+            if crate::diff_index::unchanged(reuse, &dcb_entry.name, dcb_entry.crc32, dcb_entry.uncompressed_size)
+                && output.join("DataCore.dcb.zst").is_file()
+                && crate::diff_outputs::has_extension(&output.join("DataCore"), format.extension())?
+                && crate::diff_outputs::has_extension(&output.join("DataCoreTypes"), "xml")?
+                && crate::diff_outputs::has_extension(&output.join("DataCoreEnums"), "xml")? {
+                eprintln!("[SKIP] DataCore CRC32 and size unchanged");
+                return Ok(());
+            }
+            let dcb_bytes = p4k.read(dcb_entry)?;
+            let db = starbreaker_datacore::database::Database::from_bytes(&dcb_bytes)?;
+            for directory in ["DataCore", "DataCoreTypes", "DataCoreEnums"] {
+                let path = output.join(directory);
+                if !keep && path.is_dir() { parallel_remove_dir_all(&path)?; }
+            }
+            crate::dcb::extract_database(
+                &db,
+                &output.join("DataCore"),
                 match format {
                     ManifestFormat::Xml => DcbFormat::DataForge,
                     ManifestFormat::Json => DcbFormat::Json,
                 },
                 None,
-            )
+            )?;
+            dump_data_core_types(&db, &output.join("DataCoreTypes"))?;
+            dump_data_core_enums(&db, &output.join("DataCoreEnums"))?;
+            let backup = output.join("DataCore.dcb.zst");
+            let mut writer = BufWriter::new(File::create(&backup)?);
+            zstd::stream::copy_encode(dcb_bytes.as_slice(), &mut writer, 3)?;
+            writer.flush()?;
+            Ok(())
         })?;
 
         timed("P4k XML/animation/SOC contents", || {
-            crate::diff_p4k_contents::extract_p4k_contents(&p4k, &p4kcontents_dir)
+            crate::diff_p4k_contents::extract_incremental_contents(&p4k, &p4kcontents_dir, reuse)
         })?;
 
         if extract_dds {
@@ -122,30 +156,23 @@ impl DiffArgs {
                 crate::diff_dds::extract_dds_files(
                     &p4k,
                     &output.join("DDS_Files"),
-                    diff_against.as_deref(),
+                    &current,
+                    reuse,
                 )
             })?;
         }
 
-        if let Some(against) = diff_against.as_deref() {
-            timed("New SOCPAK list", || write_new_socpak_list(&p4k, against, &output))?;
+        if let Some(previous) = previous.as_ref() {
+            timed("New SOCPAK list", || write_new_socpak_list(&current, previous, &output))?;
         }
 
-        let (_p4k_for_dcb, dcb_bytes) = crate::common::load_dcb_bytes(Some(&p4k_path), None)?;
-        let db = starbreaker_datacore::database::Database::from_bytes(&dcb_bytes)?;
-        timed("DataCore types", || {
-            dump_data_core_types(&db, &output.join("DataCoreTypes"))
-        })?;
-        timed("DataCore enums", || {
-            dump_data_core_enums(&db, &output.join("DataCoreEnums"))
-        })?;
-
-        timed("DataCore.dcb.zst", || {
-            extract_dcb_to_zst(&p4k, &output.join("DataCore.dcb.zst"))
-        })?;
         if exe_path.exists() {
             timed("StarCitizen.exe.zst", || {
-                compress_file_to_zst(&exe_path, &output.join("StarCitizen.exe.zst"))
+                let backup = output.join("StarCitizen.exe.zst");
+                if backup.is_file() && crate::diff_outputs::backup_matches(&exe_path, &backup)? {
+                    return Ok(());
+                }
+                compress_file_to_zst(&exe_path, &backup)
             })?;
         } else {
             eprintln!("[SKIP] {} not found — skipping exe.zst", exe_path.display());
@@ -153,6 +180,17 @@ impl DiffArgs {
         timed("build_manifest.json", || {
             copy_build_manifest(&game.join("build_manifest.id"), &output.join("build_manifest.json"))
         })?;
+        if !keep {
+            timed("Remove obsolete exported content", || crate::diff_p4k_contents::remove_obsolete_contents(&p4kcontents_dir, previous.as_ref(), &current))?;
+        }
+        timed("Update dump manifests", || {
+            dump_p4k_manifest(&p4k, &output.join("P4k"), format)?;
+            Ok(())
+        })?;
+        for name in ["P4k.index.json", "Diff.cache.json"] {
+            let path = output.join(name);
+            if path.is_file() { std::fs::remove_file(path)?; }
+        }
 
         eprintln!("[DONE] total: {:.1}s", total.elapsed().as_secs_f64());
         Ok(())
@@ -160,19 +198,14 @@ impl DiffArgs {
 }
 
 fn write_new_socpak_list(
-    current: &MappedP4k,
-    diff_against: &Path,
+    current: &crate::diff_index::FileIndex,
+    previous: &crate::diff_index::FileIndex,
     output: &Path,
 ) -> Result<()> {
-    let previous_path = crate::p4k_compare::resolve_previous_p4k_path(diff_against);
-    if !previous_path.is_file() {
-        return Err(CliError::NotFound(format!(
-            "previous P4K not found at {}",
-            previous_path.display()
-        )));
-    }
-    let previous = MappedP4k::open(&previous_path)?;
-    crate::p4k_compare::write_added_socpak_list(current, &previous, output)?;
+    let added = crate::diff_index::added_containers(current, previous);
+    let content = if added.is_empty() { String::new() } else { format!("{}\n", added.join("\n")) };
+    std::fs::write(output.join("New_SOCPAK_Files.txt"), content)?;
+    eprintln!("Found {} new SOCPAK / object-container files.", added.len());
     Ok(())
 }
 
@@ -208,42 +241,10 @@ fn parallel_remove_dir_all(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn clear_old(output: &Path) -> Result<()> {
-    let folders = [
-        "DataCore",
-        "DataCoreTypes",
-        "DataCoreEnums",
-        "P4k",
-        "P4kContents",
-        "DDS_Files",
-    ];
-    let files = [
-        "build_manifest.json",
-        "DataCore.dcb.zst",
-        "StarCitizen.exe.zst",
-        "New_SOCPAK_Files.txt",
-    ];
-
-    folders.par_iter().try_for_each(|name| -> Result<()> {
-        let p = output.join(name);
-        if p.exists() {
-            parallel_remove_dir_all(&p)?;
-        }
-        Ok(())
-    })?;
-    for name in files {
-        let p = output.join(name);
-        if p.exists() {
-            std::fs::remove_file(&p)
-                .map_err(|e| CliError::IoPath { source: e, path: p.display().to_string() })?;
-        }
-    }
-    Ok(())
-}
-
-fn dump_p4k_manifest(p4k: &MappedP4k, output: &Path, format: ManifestFormat) -> Result<()> {
+pub(crate) fn dump_p4k_manifest(p4k: &MappedP4k, output: &Path, format: ManifestFormat) -> Result<crate::diff_index::FileIndex> {
     std::fs::create_dir_all(output)?;
     let ext = format.extension();
+    let old_manifests = crate::diff_outputs::files_under(output)?;
 
     let mut by_dir: BTreeMap<String, Vec<&P4kEntry>> = BTreeMap::new();
     let mut socpak_refs: Vec<&P4kEntry> = Vec::new();
@@ -253,7 +254,6 @@ fn dump_p4k_manifest(p4k: &MappedP4k, output: &Path, format: ManifestFormat) -> 
         let is_shadercache = lower.contains("shadercache_");
         if is_archive && !is_shadercache {
             socpak_refs.push(entry);
-            continue;
         }
         let norm = entry.name.replace('\\', "/");
         let dir = norm.rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_default();
@@ -272,10 +272,10 @@ fn dump_p4k_manifest(p4k: &MappedP4k, output: &Path, format: ManifestFormat) -> 
         Ok(())
     })?;
 
-    by_dir
+    let written: Result<Vec<_>> = by_dir
         .par_iter()
         .filter(|(_, children)| !children.is_empty())
-        .try_for_each(|(dir, children)| -> Result<()> {
+        .map(|(dir, children)| -> Result<PathBuf> {
             let (manifest_path, dir_name) = if dir.is_empty() {
                 (output.join(format!("root.{ext}")), String::new())
             } else {
@@ -292,29 +292,42 @@ fn dump_p4k_manifest(p4k: &MappedP4k, output: &Path, format: ManifestFormat) -> 
                 ManifestFormat::Xml => write_manifest_xml(&manifest_path, &dir_name, &sorted)?,
                 ManifestFormat::Json => write_manifest_json(&manifest_path, &dir_name, &sorted)?,
             }
-            Ok(())
-        })?;
+            Ok(manifest_path)
+        }).collect();
+    let mut written = written?;
 
-    socpak_refs.par_iter().try_for_each(|socpak_entry| -> Result<()> {
+    let nested: Result<Vec<_>> = socpak_refs.par_iter().map(|socpak_entry| {
         let data = match p4k.read(socpak_entry) {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("[WARN] could not read socpak {}: {e}", socpak_entry.name);
-                return Ok(());
+                return Err(e.into());
             }
         };
         let inner = match P4kArchive::from_bytes(&data) {
             Ok(a) => a,
             Err(e) => {
                 eprintln!("[WARN] could not parse socpak {}: {e}", socpak_entry.name);
-                return Ok(());
+                return Err(e.into());
             }
         };
         let socpak_rel = socpak_entry.name.replace('\\', "/");
-        dump_archive_manifests(output, &socpak_rel, &inner, ext, format)
-    })?;
+        let files = dump_archive_manifests(output, &socpak_rel, &inner, ext, format)?;
+        let mut index = crate::diff_index::FileIndex::new();
+        crate::diff_index::add_archive(&mut index, &socpak_rel, &inner)?;
+        Ok((index, files))
+    }).collect();
 
-    Ok(())
+    let mut index = crate::diff_index::FileIndex::with_capacity(p4k.entries().len());
+    for entry in p4k.entries() { crate::diff_index::add_entry(&mut index, "", entry); }
+    for (children, files) in nested? { index.extend(children); written.extend(files); }
+    let retained: std::collections::HashSet<_> = written.iter().map(|path| crate::diff_index::key(&path.to_string_lossy())).collect();
+    for path in old_manifests {
+        if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("xml") || ext.eq_ignore_ascii_case("json"))
+            && !retained.contains(&crate::diff_index::key(&path.to_string_lossy())) { std::fs::remove_file(path)?; }
+    }
+    crate::diff_outputs::prune_empty_directories(output)?;
+    Ok(index)
 }
 
 fn dump_archive_manifests(
@@ -323,7 +336,7 @@ fn dump_archive_manifests(
     archive: &P4kArchive<'_>,
     ext: &str,
     format: ManifestFormat,
-) -> Result<()> {
+) -> Result<Vec<PathBuf>> {
     let base_leaf = Path::new(base_rel)
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -336,6 +349,7 @@ fn dump_archive_manifests(
         by_dir.entry(dir).or_default().push(entry);
     }
 
+    let mut files = Vec::new();
     for (dir, children) in &by_dir {
         if children.is_empty() {
             continue;
@@ -361,8 +375,14 @@ fn dump_archive_manifests(
             ManifestFormat::Xml => write_manifest_xml(&manifest_path, &dir_name, &sorted)?,
             ManifestFormat::Json => write_manifest_json(&manifest_path, &dir_name, &sorted)?,
         }
+        files.push(manifest_path);
     }
-    Ok(())
+    for entry in archive.entries().iter().filter(|entry| crate::p4k_compare::is_socpak_path(&entry.name)) {
+        let bytes = archive.read(entry)?;
+        let child = P4kArchive::from_bytes(&bytes)?;
+        files.extend(dump_archive_manifests(output, &format!("{base_rel}/{}", entry.name.replace('\\', "/")), &child, ext, format)?);
+    }
+    Ok(files)
 }
 
 fn write_manifest_xml(path: &Path, dir_name: &str, entries: &[&P4kEntry]) -> Result<()> {
@@ -381,7 +401,7 @@ fn write_manifest_xml(path: &Path, dir_name: &str, entries: &[&P4kEntry]) -> Res
         ));
     }
     s.push_str("</Directory>");
-    std::fs::write(path, s)?;
+    crate::diff_outputs::write_changed(path, s.as_bytes())?;
     Ok(())
 }
 
@@ -401,7 +421,7 @@ fn write_manifest_json(path: &Path, dir_name: &str, entries: &[&P4kEntry]) -> Re
         .collect();
     let obj = serde_json::json!({ "Name": dir_name, "Files": files });
     let bytes = serde_json::to_vec_pretty(&obj)?;
-    std::fs::write(path, &bytes)?;
+    crate::diff_outputs::write_changed(path, &bytes)?;
     Ok(())
 }
 
@@ -450,16 +470,17 @@ fn xml_text(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
-fn extract_localization(p4k: &MappedP4k, output: &Path) -> Result<()> {
+fn extract_localization(p4k: &MappedP4k, output: &Path, previous: Option<&crate::diff_index::FileIndex>) -> Result<()> {
     let candidates = [
         "Data/Localization/english/global.ini",
         "Data\\Localization\\english\\global.ini",
     ];
     for path in candidates {
         if let Some(entry) = p4k.entry_case_insensitive(path) {
-            let data = p4k.read(entry)?;
             let rel = entry.name.replace('\\', "/");
             let out_path = output.join(&rel);
+            if out_path.is_file() && crate::diff_index::unchanged(previous, &entry.name, entry.crc32, entry.uncompressed_size) { return Ok(()); }
+            let data = p4k.read(entry)?;
             if let Some(parent) = out_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -471,51 +492,15 @@ fn extract_localization(p4k: &MappedP4k, output: &Path) -> Result<()> {
     Ok(())
 }
 
-fn extract_tag_database(p4k: &MappedP4k, output: &Path) -> Result<()> {
-    let needle = "tagdatabase.tagdatabase.xml";
-    let entry = p4k
-        .entries()
-        .iter()
-        .find(|e| e.name.to_ascii_lowercase().contains(needle));
-    let Some(entry) = entry else {
-        eprintln!("[WARN] TagDatabase not found in P4k");
-        return Ok(());
-    };
-
-    let bytes = p4k.read(entry)?;
-    let rel = entry.name.replace('\\', "/");
-    let out_path = output.join(&rel);
-    if let Some(parent) = out_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    if starbreaker_cryxml::is_cryxmlb(&bytes) {
-        match starbreaker_cryxml::from_bytes(&bytes) {
-            Ok(xml) => {
-                let out = crate::diff_p4k_contents::text_to_crlf_bytes(format!("{xml}").as_bytes());
-                std::fs::write(&out_path, &out)?;
-            }
-            Err(_) => {
-                let out = crate::diff_p4k_contents::text_to_crlf_bytes(&bytes);
-                std::fs::write(&out_path, &out)?;
-            }
-        }
-    } else {
-        let out = crate::diff_p4k_contents::text_to_crlf_bytes(&bytes);
-        std::fs::write(&out_path, &out)?;
-    }
-    Ok(())
-}
-
 fn dump_data_core_types(
     db: &starbreaker_datacore::database::Database,
     output: &Path,
-) -> Result<()> {
+) -> Result<Vec<PathBuf>> {
     std::fs::create_dir_all(output)?;
     let struct_defs = db.struct_defs();
     let property_defs = db.property_defs();
 
-    struct_defs.par_iter().try_for_each(|def| -> Result<()> {
+    struct_defs.par_iter().map(|def| -> Result<PathBuf> {
         let name = db.resolve_string2(def.name_offset);
         let parent_idx = def.parent_type_index;
         let mut s = String::with_capacity(512);
@@ -546,9 +531,8 @@ fn dump_data_core_types(
         let out_path = output.join(format!("{name}.xml"));
         std::fs::write(&out_path, s)
             .map_err(|e| CliError::IoPath { source: e, path: out_path.display().to_string() })?;
-        Ok(())
-    })?;
-    Ok(())
+        Ok(out_path)
+    }).collect()
 }
 
 fn property_type_string(
@@ -592,13 +576,13 @@ fn property_type_string(
 fn dump_data_core_enums(
     db: &starbreaker_datacore::database::Database,
     output: &Path,
-) -> Result<()> {
+) -> Result<Vec<PathBuf>> {
     std::fs::create_dir_all(output)?;
     let enum_defs = db.enum_defs();
 
     (0..enum_defs.len() as i32)
         .into_par_iter()
-        .try_for_each(|enum_index| -> Result<()> {
+        .map(|enum_index| -> Result<PathBuf> {
             let def = &enum_defs[enum_index as usize];
             let name = db.resolve_string2(def.name_offset);
             let options = db.enum_options(enum_index);
@@ -619,34 +603,19 @@ fn dump_data_core_enums(
             let out_path = output.join(format!("{name}.xml"));
             std::fs::write(&out_path, s)
                 .map_err(|e| CliError::IoPath { source: e, path: out_path.display().to_string() })?;
-            Ok(())
-        })?;
-    Ok(())
-}
-
-fn extract_dcb_to_zst(p4k: &MappedP4k, zst_path: &Path) -> Result<()> {
-    let dcb_bytes = p4k
-        .read_file("Data\\Game2.dcb")
-        .or_else(|_| p4k.read_file("Data\\Game.dcb"))?;
-    if let Some(parent) = zst_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut out = File::create(zst_path)?;
-    let compressed = zstd::stream::encode_all(&dcb_bytes[..], 3)?;
-    out.write_all(&compressed)?;
-    Ok(())
+            Ok(out_path)
+        }).collect()
 }
 
 fn compress_file_to_zst(input: &Path, zst_path: &Path) -> Result<()> {
     if let Some(parent) = zst_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut input_file = File::open(input)
+    let input_file = File::open(input)
         .map_err(|e| CliError::IoPath { source: e, path: input.display().to_string() })?;
-    let mut buf = Vec::new();
-    input_file.read_to_end(&mut buf)?;
-    let compressed = zstd::stream::encode_all(&buf[..], 3)?;
-    std::fs::write(zst_path, &compressed)?;
+    let mut output = BufWriter::new(File::create(zst_path)?);
+    zstd::stream::copy_encode(BufReader::new(input_file), &mut output, 3)?;
+    output.flush()?;
     Ok(())
 }
 
@@ -658,7 +627,6 @@ fn copy_build_manifest(input: &Path, output: &Path) -> Result<()> {
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::copy(input, output)
-        .map_err(|e| CliError::IoPath { source: e, path: output.display().to_string() })?;
+    crate::diff_outputs::write_changed(output, &std::fs::read(input)?)?;
     Ok(())
 }

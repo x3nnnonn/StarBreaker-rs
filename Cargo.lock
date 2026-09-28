@@ -5334,6 +5334,7 @@ dependencies = [
  "anyhow",
  "clap",
  "crc32c",
+ "crc32fast",
  "env_logger",
  "glob-match",
  "image",

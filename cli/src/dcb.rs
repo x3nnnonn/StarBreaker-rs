@@ -96,7 +96,10 @@ pub(crate) fn extract(
 ) -> Result<()> {
     let (_p4k, dcb_bytes) = load_dcb_bytes(p4k_path.as_deref(), dcb_path.as_deref())?;
     let db = Database::from_bytes(&dcb_bytes)?;
+    extract_database(&db, &output, format, filter.as_deref()).map(|_| ())
+}
 
+pub(crate) fn extract_database(db: &Database<'_>, output: &Path, format: DcbFormat, filter: Option<&str>) -> Result<Vec<PathBuf>> {
     eprintln!("DataCore loaded.");
 
     let ext = match format {
@@ -114,7 +117,7 @@ pub(crate) fn extract(
                 return false;
             }
             let file_name = db.resolve_string(r.file_name_offset);
-            matches_filter(file_name, filter.as_deref(), None)
+            matches_filter(file_name, filter, None)
         })
         .collect();
 
@@ -156,8 +159,7 @@ pub(crate) fn extract(
     records
         .par_iter()
         .zip(out_paths.par_iter())
-        .for_each(|(record, out_path)| {
-            let file_name = db.resolve_string(record.file_name_offset);
+        .try_for_each(|(record, out_path)| -> Result<()> {
             let result = match format {
                 DcbFormat::Json => starbreaker_datacore::export::to_json(&db, record),
                 DcbFormat::Unp4k => starbreaker_datacore::export::to_unp4k_xml(&db, record),
@@ -165,20 +167,14 @@ pub(crate) fn extract(
                 DcbFormat::DataForge => starbreaker_datacore::export::to_dataforge_xml(&db, record),
             };
 
-            match result {
-                Ok(data) => {
-                    if let Err(e) = std::fs::write(out_path, &data) {
-                        eprintln!("Error writing {}: {e}", out_path.display());
-                    }
-                }
-                Err(e) => eprintln!("Error exporting {file_name}: {e}"),
-            }
+            std::fs::write(out_path, result?)?;
             pb.inc(1);
-        });
+            Ok(())
+        })?;
 
     pb.finish_and_clear();
     eprintln!("Done.");
-    Ok(())
+    Ok(out_paths)
 }
 
 fn query(

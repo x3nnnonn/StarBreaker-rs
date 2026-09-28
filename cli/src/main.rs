@@ -4,6 +4,8 @@ mod cryxml;
 mod dcb;
 mod dds;
 mod diff;
+mod diff_index;
+mod diff_outputs;
 mod diff_dds;
 mod diff_p4k_contents;
 mod diff_xml;

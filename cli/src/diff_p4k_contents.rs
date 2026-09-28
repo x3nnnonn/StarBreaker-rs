@@ -18,15 +18,39 @@ mod dba_tests;
 #[path = "diff_entdata_tests.rs"]
 mod entdata_tests;
 
+#[cfg(test)]
+#[path = "diff_incremental_tests.rs"]
+mod incremental_tests;
+
+#[cfg(test)]
 pub fn extract_p4k_contents(p4k: &MappedP4k, output: &Path) -> Result<()> {
+    extract_incremental_contents(p4k, output, None)
+}
+
+pub fn extract_archive_contents(output: &Path, relative: &str, archive: &P4kArchive<'_>, previous: Option<&crate::diff_index::FileIndex>) -> Result<usize> {
+    let mut count = 0;
+    for entry in archive.entries() {
+        let source = format!("{relative}/{}", entry.name.replace('\\', "/"));
+        if is_socpak_entry(&entry.name) {
+            let bytes = archive.read(entry)?;
+            count += extract_archive_contents(output, &source, &P4kArchive::from_bytes(&bytes)?, previous)?;
+            continue;
+        }
+        if !is_diff_content(&entry.name) { continue; }
+        count += usize::from(extract_source(output, &source, entry, previous, || Ok(archive.read(entry)?))?);
+    }
+    Ok(count)
+}
+
+pub fn extract_incremental_contents(p4k: &MappedP4k, output: &Path, previous: Option<&crate::diff_index::FileIndex>) -> Result<()> {
     std::fs::create_dir_all(output)?;
     let main_count = AtomicUsize::new(0);
     let nested_count = AtomicUsize::new(0);
     p4k.entries().par_iter().try_for_each(|entry| -> Result<()> {
         if ends_with_ci(&entry.name, ".dba") { return Ok(()); }
         if is_diff_content(&entry.name) {
-            extract_content_bytes(output, &normalize_relative_path(&entry.name), &p4k.read(entry)?)?;
-            main_count.fetch_add(1, Ordering::Relaxed);
+            let changed = extract_source(output, &entry.name, entry, previous, || Ok(p4k.read(entry)?))?;
+            main_count.fetch_add(usize::from(changed), Ordering::Relaxed);
             return Ok(());
         }
         if !is_socpak_entry(&entry.name) { return Ok(()); }
@@ -35,30 +59,29 @@ pub fn extract_p4k_contents(p4k: &MappedP4k, output: &Path) -> Result<()> {
             Ok(data) => data,
             Err(e) => {
                 eprintln!("[WARN] could not read socpak {}: {e}", entry.name);
-                return Ok(());
+                return Err(e.into());
             }
         };
         let inner = match P4kArchive::from_bytes(&socpak_data) {
             Ok(archive) => archive,
             Err(e) => {
                 eprintln!("[WARN] could not parse socpak {}: {e}", entry.name);
-                return Ok(());
+                return Err(e.into());
             }
         };
 
-        for inner_entry in inner.entries() {
-            if !is_diff_content(&inner_entry.name) { continue; }
-            let nested_rel = socpak_nested_output_path(&socpak_rel, &inner_entry.name);
-            let bytes = inner.read(inner_entry)?;
-            extract_content_bytes(output, &nested_rel, &bytes)?;
-            nested_count.fetch_add(1, Ordering::Relaxed);
-        }
+        nested_count.fetch_add(extract_archive_contents(output, &socpak_rel, &inner, previous)?, Ordering::Relaxed);
         return Ok(());
     })?;
-    for entry in p4k.entries().iter().filter(|entry| ends_with_ci(&entry.name, ".dba")) {
-        extract_content_bytes(output, &normalize_relative_path(&entry.name), &p4k.read(entry)?)?;
-        main_count.fetch_add(1, Ordering::Relaxed);
-    }
+    let databases: Vec<_> = p4k.entries().iter().filter(|entry| ends_with_ci(&entry.name, ".dba")).collect();
+    let database_workers = rayon::current_num_threads().min(4);
+    rayon::ThreadPoolBuilder::new().num_threads(database_workers).build()?.install(|| {
+        databases.par_iter().try_for_each(|entry| -> Result<()> {
+            let changed = extract_source(output, &entry.name, entry, previous, || Ok(p4k.read(entry)?))?;
+            main_count.fetch_add(usize::from(changed), Ordering::Relaxed);
+            Ok(())
+        })
+    })?;
     eprintln!(
         "Extracted {} P4K + {} SOCPAK content files (XML assets, SOC and readable DBA)",
         main_count.load(Ordering::Relaxed), nested_count.load(Ordering::Relaxed)
@@ -71,18 +94,39 @@ fn is_xml_asset(name: &str) -> bool {
         .iter().any(|extension| ends_with_ci(name, extension))
 }
 
+fn extract_source(output: &Path, source: &str, entry: &starbreaker_p4k::P4kEntry, previous: Option<&crate::diff_index::FileIndex>, read: impl FnOnce() -> Result<Vec<u8>>) -> Result<bool> {
+    let relative = crate::diff_outputs::content_path(source);
+    if crate::diff_index::unchanged(previous, source, entry.crc32, entry.uncompressed_size)
+        && !crate::diff_outputs::content_files(output, &relative)?.is_empty() { return Ok(false); }
+    let bytes = read()?;
+    crate::diff_outputs::remove_content(output, &relative)?;
+    extract_content_bytes(output, &relative, &bytes)?;
+    Ok(true)
+}
+
+pub fn remove_obsolete_contents(output: &Path, previous: Option<&crate::diff_index::FileIndex>, current: &crate::diff_index::FileIndex) -> Result<()> {
+    if let Some(previous) = previous {
+        let retained: std::collections::HashSet<_> = current.keys().filter(|path| is_diff_content(path)).map(|path| crate::diff_outputs::content_path(path)).collect();
+        for source in previous.keys().filter(|source| !current.contains_key(*source) && is_diff_content(source)) {
+            let relative = crate::diff_outputs::content_path(source);
+            if !retained.contains(&relative) { crate::diff_outputs::remove_content(output, &relative)?; }
+        }
+    }
+    Ok(())
+}
+
 fn is_diff_content(name: &str) -> bool {
     is_xml_asset(name) || ends_with_ci(name, ".soc") || ends_with_ci(name, ".dba")
 }
 
-pub(crate) fn extract_content_bytes(output: &Path, relative_path: &str, bytes: &[u8]) -> Result<()> {
+pub(crate) fn extract_content_bytes(output: &Path, relative_path: &str, bytes: &[u8]) -> Result<Vec<std::path::PathBuf>> {
     if ends_with_ci(relative_path, ".soc") {
         extract_soc_bytes(output, relative_path, bytes)
     } else if ends_with_ci(relative_path, ".dba") {
         let mut summary = animation_database_summary(bytes);
         let path = output.join(format!("{relative_path}.json"));
         if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
-        let mut writer = BufWriter::new(std::fs::File::create(path)?);
+        let mut writer = BufWriter::with_capacity(128 * 1024, std::fs::File::create(&path)?);
         let header = serde_json::to_string_pretty(&summary)?;
         writer.write_all(&text_to_crlf_bytes(header[..header.len() - 1].as_bytes()))?;
         writer.write_all(b",\r\n\"animation_database\":")?;
@@ -102,9 +146,10 @@ pub(crate) fn extract_content_bytes(output: &Path, relative_path: &str, bytes: &
             Err(error) => return Err(error.into()),
         }
         writer.flush()?;
-        Ok(())
+        Ok(vec![path])
     } else {
-        extract_xml_bytes(output, relative_path, bytes)
+        extract_xml_bytes(output, relative_path, bytes)?;
+        Ok(vec![output.join(relative_path)])
     }
 }
 
@@ -173,7 +218,7 @@ fn extract_xml_bytes(output: &Path, relative_path: &str, bytes: &[u8]) -> Result
     Ok(())
 }
 
-fn extract_soc_bytes(output: &Path, relative_path: &str, soc_bytes: &[u8]) -> Result<()> {
+fn extract_soc_bytes(output: &Path, relative_path: &str, soc_bytes: &[u8]) -> Result<Vec<std::path::PathBuf>> {
     let adjusted_rel = normalize_soc_relative_path(relative_path);
     let entry_path = output.join(&adjusted_rel);
     let object_container_dir = entry_path
@@ -191,11 +236,12 @@ fn extract_soc_bytes(output: &Path, relative_path: &str, soc_bytes: &[u8]) -> Re
         Ok(ChunkFile::CrCh(crch_file)) => crch_file,
         Ok(_) | Err(_) => {
             let raw_path = object_container_dir.join(entry_path.file_name().unwrap_or_default());
-            std::fs::write(raw_path, soc_bytes)?;
-            return Ok(());
+            std::fs::write(&raw_path, soc_bytes)?;
+            return Ok(vec![raw_path]);
         }
     };
 
+    let mut files = Vec::new();
     for (i, chunk) in chunk_file.chunks().iter().enumerate() {
         let chunk_data = chunk_file.chunk_data(chunk);
         let chunk_type_name = crch::name(chunk.chunk_type)
@@ -208,7 +254,8 @@ fn extract_soc_bytes(output: &Path, relative_path: &str, soc_bytes: &[u8]) -> Re
                     let xml_path = object_container_dir
                         .join(format!("{base_name}_{i}_{chunk_type_name}.xml"));
                     let bytes = text_to_crlf_bytes(format!("{xml}").as_bytes());
-                    std::fs::write(xml_path, &bytes)?;
+                    std::fs::write(&xml_path, &bytes)?;
+                    files.push(xml_path);
                     continue;
                 }
                 Err(_) => {}
@@ -221,7 +268,8 @@ fn extract_soc_bytes(output: &Path, relative_path: &str, soc_bytes: &[u8]) -> Re
                     let txt_path = object_container_dir
                         .join(format!("{base_name}_{i}_{chunk_type_name}.txt"));
                     let bytes = text_to_crlf_bytes(included.format_text().as_bytes());
-                    std::fs::write(txt_path, &bytes)?;
+                    std::fs::write(&txt_path, &bytes)?;
+                    files.push(txt_path);
                     continue;
                 }
                 Err(_) => {}
@@ -229,10 +277,11 @@ fn extract_soc_bytes(output: &Path, relative_path: &str, soc_bytes: &[u8]) -> Re
         }
 
         let bin_path = object_container_dir.join(format!("{base_name}_{i}_{chunk_type_name}.bin"));
-        std::fs::write(bin_path, chunk_data)?;
+        std::fs::write(&bin_path, chunk_data)?;
+        files.push(bin_path);
     }
 
-    Ok(())
+    Ok(files)
 }
 
 pub(crate) fn text_to_crlf_bytes(data: &[u8]) -> Vec<u8> {
@@ -270,6 +319,7 @@ fn normalize_soc_relative_path(relative_path: &str) -> String {
         .join("/")
 }
 
+#[cfg(test)]
 fn socpak_nested_output_path(socpak_rel: &str, inner_rel: &str) -> String {
     let socpak_rel = socpak_rel.replace('\\', "/");
     let inner_rel = normalize_soc_relative_path(inner_rel);
@@ -287,7 +337,7 @@ fn socpak_nested_output_path(socpak_rel: &str, inner_rel: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -389,7 +439,7 @@ mod tests {
         std::fs::remove_dir_all(output).unwrap();
     }
 
-    fn stored_archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    pub(crate) fn stored_archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut bytes = Vec::new();
         let mut directory = Vec::new();
         for &(name, payload) in entries {
