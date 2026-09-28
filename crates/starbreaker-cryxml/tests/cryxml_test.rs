@@ -50,6 +50,16 @@ fn rejects_invalid_data() {
 }
 
 #[test]
+fn displayed_xml_declares_its_actual_utf8_encoding() {
+    let mut data=b"CryXmlB\0".to_vec();
+    for value in [0u32,44,1,72,0,72,0,72,10] { data.extend(value.to_le_bytes()); }
+    for value in [0u32,0,0,u32::MAX,0,0,0] { data.extend(value.to_le_bytes()); }
+    data.extend(b"ATLConfig\0");
+    let text=starbreaker_cryxml::from_bytes(&data).unwrap().to_string();
+    assert_eq!(text,"<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n<ATLConfig />");
+}
+
+#[test]
 #[ignore = "requires extracted game data on disk"]
 fn matches_csharp_output() {
     // Parse the binary CryXmlB file.

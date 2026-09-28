@@ -9,6 +9,9 @@ pub enum ChunkFileError {
     #[error("unsupported version: {0:#x}")]
     UnsupportedVersion(u32),
 
+    #[error("chunk range at {0} with size {1} exceeds file length {2}")]
+    InvalidChunkRange(u64, u64, usize),
+
     /// A lower-level parse error (truncation, bad layout, etc.).
     #[error(transparent)]
     Parse(#[from] starbreaker_common::ParseError),

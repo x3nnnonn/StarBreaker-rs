@@ -134,7 +134,7 @@ impl<'a> CryXml<'a> {
 impl fmt::Display for CryXml<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut buf = String::with_capacity(256);
-        buf.push_str("<?xml version=\"1.0\" encoding=\"utf-16\"?>\r\n");
+        buf.push_str("<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n");
         self.write_node(&mut buf, 0, 0);
         if buf.ends_with("\r\n") {
             buf.truncate(buf.len() - 2);

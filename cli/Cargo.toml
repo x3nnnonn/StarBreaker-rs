@@ -30,9 +30,10 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 serde_json = "1.0.149"
 parking_lot = { workspace = true }
 zstd = "0.13"
+crc32c = "0.6"
+quick-xml = "0.37"
 
 # Dev-dependencies used only by examples (not shipped in the release binary).
 [dev-dependencies]
-crc32c = "0.6"
 starbreaker-common = { path = "../crates/starbreaker-common" }
 anyhow = "1"

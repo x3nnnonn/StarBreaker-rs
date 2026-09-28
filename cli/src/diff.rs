@@ -28,6 +28,7 @@ impl ManifestFormat {
 }
 
 #[derive(Args)]
+#[command(about = "Export a diff snapshot including DataCore, XML assets, animation databases and object containers")]
 pub struct DiffArgs {
     #[arg(long, short = 'g', env = "GAME_FOLDER")]
     pub game: PathBuf,
@@ -112,8 +113,8 @@ impl DiffArgs {
             )
         })?;
 
-        timed("P4k XML/SOC contents", || {
-            crate::diff_p4k_contents::extract_p4k_xml_files(&p4k, &p4kcontents_dir)
+        timed("P4k XML/animation/SOC contents", || {
+            crate::diff_p4k_contents::extract_p4k_contents(&p4k, &p4kcontents_dir)
         })?;
 
         if extract_dds {

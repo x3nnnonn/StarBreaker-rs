@@ -6,6 +6,7 @@ mod dds;
 mod diff;
 mod diff_dds;
 mod diff_p4k_contents;
+mod diff_xml;
 mod entity;
 mod error;
 mod glb;

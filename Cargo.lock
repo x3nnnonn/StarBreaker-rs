@@ -5340,6 +5340,7 @@ dependencies = [
  "indicatif",
  "log",
  "parking_lot",
+ "quick-xml 0.37.5",
  "rayon",
  "regex",
  "serde_json",

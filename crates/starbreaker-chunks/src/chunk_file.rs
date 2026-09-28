@@ -148,7 +148,11 @@ fn parse_ivo<'a>(
     }
 
     let chunk_count = *reader.read_type::<u32>()?;
-    let _chunk_table_offset = *reader.read_type::<u32>()?;
+    let chunk_table_offset = *reader.read_type::<u32>()?;
+    if chunk_table_offset < 16 || u64::from(chunk_table_offset) + u64::from(chunk_count) * 16 > data.len() as u64 {
+        return Err(ChunkFileError::InvalidChunkRange(u64::from(chunk_table_offset), u64::from(chunk_count) * 16, data.len()));
+    }
+    reader.set_position(chunk_table_offset as usize);
 
     // Read the raw chunk table entries
     let raw_entries = reader.read_slice::<IvoChunkTableEntry>(chunk_count as usize)?;
@@ -163,6 +167,11 @@ fn parse_ivo<'a>(
 
     // Compute sizes from gaps between consecutive offsets
     let file_len = data.len() as u64;
+    for &(_, offset) in &by_offset {
+        if offset > file_len {
+            return Err(ChunkFileError::InvalidChunkRange(offset, 0, data.len()));
+        }
+    }
     let mut sizes = vec![0usize; raw_entries.len()];
     for (pos, &(idx, offset)) in by_offset.iter().enumerate() {
         let next_offset = if pos + 1 < by_offset.len() {
@@ -204,6 +213,14 @@ fn parse_crch<'a>(
     let _chunk_table_offset = *reader.read_type::<u32>()?;
 
     let raw_entries = reader.read_slice::<CrChChunkTableEntry>(chunk_count as usize)?;
+
+    for entry in raw_entries {
+        if u64::from(entry.offset) + u64::from(entry.size) > data.len() as u64 {
+            return Err(ChunkFileError::InvalidChunkRange(
+                u64::from(entry.offset), u64::from(entry.size), data.len(),
+            ));
+        }
+    }
 
     let chunks: Vec<CrChChunkEntry> = raw_entries
         .iter()

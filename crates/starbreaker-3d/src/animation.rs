@@ -27,6 +27,9 @@ use starbreaker_chunks::ChunkFile;
 
 use crate::error::Error;
 
+pub mod dba;
+mod dba_tracks;
+
 // ── Public types ────────────────────────────────────────────────────────────
 
 /// A parsed animation database containing one or more animation clips.
