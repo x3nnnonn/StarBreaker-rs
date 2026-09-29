@@ -14,6 +14,7 @@ pub fn extract_dds_files(
     current: &FileIndex,
     previous: Option<&FileIndex>,
 ) -> Result<()> {
+    if output.is_dir() { std::fs::remove_dir_all(output)?; }
     std::fs::create_dir_all(output)?;
 
     let entries_to_extract = changed_dds_paths(current, previous);
@@ -46,7 +47,7 @@ pub fn extract_dds_files(
         .reduce(|| (0, 0), |(a, b), (c, d)| (a + c, b + d));
 
     eprintln!("Extracted {processed} DDS files ({failed} failed).");
-    if failed != 0 { return Err(CliError::InvalidInput(format!("{failed} DDS exports failed; snapshot index was not advanced"))); }
+    if failed != 0 { return Err(CliError::InvalidInput(format!("{failed} DDS exports failed. Snapshot index was not advanced"))); }
     Ok(())
 }
 
@@ -246,6 +247,33 @@ mod tests {
         let left = FileIndex::from([(key(r"Data\a.dds"), (1, 100))]);
         let right = FileIndex::from([(key(r"Data\a.dds"), (2, 100))]);
         assert_eq!(changed_dds_paths(&right, Some(&left)), vec!["data/a.dds"]);
+    }
+
+    #[test]
+    fn unchanged_run_clears_previous_dds_outputs_only() {
+        let root = std::env::temp_dir().join(format!("starbreaker-dds-cleanup-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let archive = root.join("Data.p4k");
+        std::fs::write(&archive, crate::diff_p4k_contents::tests::stored_archive(&[
+            ("Data/unchanged.dds", b"unchanged texture is not decoded"),
+        ])).unwrap();
+        let p4k = MappedP4k::open(&archive).unwrap();
+        let current = crate::diff_index::current(&p4k).unwrap();
+        let output = root.join("DDS_Files");
+        std::fs::create_dir_all(output.join("data/textures")).unwrap();
+        std::fs::write(output.join("old.png"), b"old image").unwrap();
+        std::fs::write(output.join("data/textures/old.png"), b"old nested image").unwrap();
+        let retained = root.join("DataCore/record.xml");
+        std::fs::create_dir_all(retained.parent().unwrap()).unwrap();
+        std::fs::write(&retained, b"retained record").unwrap();
+        extract_dds_files(&p4k, &output, &current, Some(&current)).unwrap();
+        assert!(output.is_dir());
+        assert!(std::fs::read_dir(&output).unwrap().next().is_none());
+        assert_eq!(std::fs::read(&retained).unwrap(), b"retained record");
+        extract_dds_files(&p4k, &output, &current, Some(&current)).unwrap();
+        assert!(std::fs::read_dir(&output).unwrap().next().is_none());
+        drop(p4k);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
